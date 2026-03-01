@@ -49,7 +49,7 @@ def main():
         vcdr_alert_threshold=config["pipeline"]["vcdr_alert_threshold"],
     )
 
-    mode = "BASELINE (vCDR > 0.5)" if baseline_mode else "RETFound + FunduSAM"
+    mode = "BASELINE (vCDR > 0.5)" if baseline_mode else "DINOv2 + BoundaryFormer"
     print(f"Tier 1 Screening Pipeline — Mode: {mode}")
     print(f"Device: {device}")
     print(f"Output: {output_dir}")

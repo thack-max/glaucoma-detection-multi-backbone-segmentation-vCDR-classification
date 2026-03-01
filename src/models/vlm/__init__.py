@@ -1,1 +1,1 @@
-from .report_generator import GlaucomaReportGenerator
+from .llama_vision_reporter import LlamaVisionReporter, ClinicalReport

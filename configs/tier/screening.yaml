@@ -1,4 +1,4 @@
-# Tier 1: Screening deployment configuration
+# Tier 1: Screening deployment configuration (GlaucoMamba)
 # Target: Rural clinics, community camps, mobile health
 # Input: Single fundus photograph
 # Latency: <5s CPU, <1s GPU
@@ -12,30 +12,39 @@ pipeline:
   vcdr_alert_threshold: 0.65
 
 segmentation:
-  model: fundusam
-  sam_checkpoint: null  # Path to SAM ViT-H weights
+  model: boundary_former
   num_classes: 3  # background, disc, cup
-  use_polar_transform: true
+  base_channels: 64
+  growth_rate: 32
+  checkpoint: null  # Path to trained BoundaryFormer weights
   image_size: 512
 
 feature_extraction:
-  model: retfound_cfp
-  checkpoint: null  # Path to RETFound-CFP weights
-  embed_dim: 1024
-  freeze_encoder: true  # Frozen for inference speed
+  model: dinov2_vitb14
+  variant: dinov2_vitb14  # AUC 0.958 for glaucoma (vs RETFound 0.940)
+  embed_dim: 768  # DINOv2-Base output dim (vs RETFound 1024)
+  freeze_encoder: true
+  use_registers: true  # Register tokens for cleaner GradCAM attention maps
   image_size: 224
 
 classifier:
   type: linear
-  input_dim: 1024
+  input_dim: 768  # DINOv2-Base dim
   checkpoint: null  # Path to trained classifier head weights
 
 fairness:
   enabled: true
-  fin_checkpoint: null
+  model: equity_attention
   num_groups: 3  # Asian, Black, White (per Harvard-GF)
+  adversarial_weight: 0.1
+  checkpoint: null
+
+explainability:
+  gradcam: true  # DINOv2 self-attention maps for visual explanation
+  vcdr_display: true  # Always show vCDR as clinically grounded metric
 
 output:
   save_overlay: true
   save_referral_json: true
+  save_attention_map: true
   output_dir: outputs/screening/

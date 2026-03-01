@@ -1,4 +1,4 @@
-# Tier 2: Specialist management deployment configuration
+# Tier 2: Specialist management deployment configuration (GlaucoMamba)
 # Target: Tertiary hospitals with OCT machines
 # Input: Sequential visits with fundus + OCT + VF + clinical data
 # Accepts referrals from Tier 1
@@ -10,50 +10,89 @@ pipeline:
   enable_vlm: false  # Must be explicitly opted in; experimental
 
 segmentation:
-  fundusam:
-    sam_checkpoint: null
+  fundus:
+    model: boundary_former
     num_classes: 3
-    use_polar_transform: true
+    base_channels: 64
+    growth_rate: 32
+    checkpoint: null
     image_size: 512
-  medsam2:
-    sam2_checkpoint: null
-    target_structures: [rnfl]
+  oct:
+    model: swin_unetr
+    in_channels: 1
+    num_classes: 4  # background, RNFL, GCL+IPL, other layers
+    embed_dim: 48
+    depths: [2, 2, 2, 2]
+    num_heads: [3, 6, 12, 24]
+    checkpoint: null
 
 feature_extraction:
-  retfound_cfp:
-    checkpoint: null
-    embed_dim: 1024
-    freeze_encoder: false  # Fine-tune for specialist tasks
-  retfound_oct:
-    checkpoint: null
-    embed_dim: 1024
-    freeze_encoder: false
+  model: dinov2_vitb14
+  variant: dinov2_vitb14
+  embed_dim: 768
+  freeze_encoder: false  # Fine-tune for specialist tasks
+  use_registers: true
+
+visual_field:
+  model: vf_graph_net
+  node_features: 3  # sensitivity, total deviation, pattern deviation
+  hidden_dim: 128
+  num_gin_layers: 4
+  output_dim: 128
+  # AUC 0.982 for VF defect detection (vs Anderson criteria 0.906)
+  checkpoint: null
 
 progression:
   temporal_encoder:
-    backbone: convnextv2_base
-    pretrained: true
-    embed_dim: 1024
+    model: delta_t_mamba  # Replaces BiLSTM — handles irregular visit intervals
+    input_dim: 768  # DINOv2 feature dim
+    d_model: 512
+    d_state: 16
+    num_layers: 4
+    expand: 2
+    dropout: 0.2
   forecaster:
-    hidden_dim: 512
-    num_layers: 2
+    model: evidential  # Calibrated uncertainty per prediction
+    temporal_dim: 512
+    clinical_dim: 32
+    vf_dim: 256  # VFGraphNet readout_dim
+    hidden_dim: 256
     dropout: 0.3
     num_classes: 2  # stable vs progressing
-  observation_window: 4
+  observation_window: 4  # visits
   # RNFL is essential (removing: AUC 0.569). VF is redundant (removing: AUC 0.975).
   primary_modality: rnfl_oct
 
+fusion:
+  model: cross_modal_attention
+  modality_dims:
+    fundus: 768    # DINOv2 fundus embedding
+    oct: 768       # DINOv2 OCT embedding
+    vf: 256        # VFGraphNet readout
+    clinical: 32   # Clinical features (IOP, age, etc.)
+  fused_dim: 512
+  num_heads: 4
+  dropout: 0.2
+  mc_samples: 10  # Monte Carlo dropout iterations for uncertainty
+
 vlm:
-  model: llava-hf/llava-v1.6-mistral-7b-hf
+  model: meta-llama/Llama-3.2-11B-Vision-Instruct
+  lora_rank: 16
   max_new_tokens: 512
+  load_in_4bit: true
   experimental: true  # Always true — VLMs hallucinate
+  # BERTScore-F1: 0.99 when fine-tuned (vs LLaVA ~0.7-0.8)
 
 fairness:
   enabled: true
-  fin_checkpoint: null
+  model: equity_attention
   num_groups: 3
+  adversarial_weight: 0.1
   audit_on_run: true
+  checkpoint: null
 
 output:
   save_progression_plot: true
+  save_uncertainty_report: true
+  save_vf_graph_importance: true
   output_dir: outputs/specialist/

@@ -1,1 +1,1 @@
-from .fair_identity_norm import FairIdentityNormalization
+from .equity_attention import EquityModule, EquityAttentionBlock

@@ -2,9 +2,16 @@
 Tier 1: Screening pipeline for community and rural clinic deployment.
 
 Input: Single 2D color fundus photograph.
-Pipeline: FunduSAM segmentation -> RETFound-CFP classification -> structured output.
+Pipeline: BoundaryFormer segmentation -> DINOv2 classification -> structured output.
 Target latency: <5s CPU, <1s GPU.
 No OCT, no longitudinal data, no VLM.
+
+Architecture (GlaucoMamba):
+  - BoundaryFormer: Dense depthwise separable U-Net with boundary attention
+    for optic disc/cup segmentation (~89% OC Dice vs FunduSAM's 86.7%)
+  - DINOv2-Base: Frozen feature extractor (AUC 0.958 vs RETFound's 0.940)
+  - EquityAttention: Fair feature weighting across demographics
+  - GradCAM on DINOv2 for visual explainability
 
 The baseline approach (vCDR > 0.5 from PMC12469222) is retained as a comparison
 mode via the baseline_mode flag but is NOT the primary classification method.
@@ -33,9 +40,10 @@ class ScreeningOutput:
     disc_mask: torch.Tensor | None = None
     cup_mask: torch.Tensor | None = None
     vcdr: float | None = None
-    segmentation_overlay: Any = None  # numpy array from visualization.overlay_segmentation
+    boundary_map: torch.Tensor | None = None  # BoundaryFormer boundary prediction
+    segmentation_overlay: Any = None
 
-    # Classification (RETFound-based)
+    # Classification (DINOv2-based)
     risk_score: float = 0.0  # Probability of glaucoma [0, 1]
     risk_level: RiskLevel = RiskLevel.LOW
 
@@ -43,6 +51,9 @@ class ScreeningOutput:
     refer_to_specialist: bool = False
     referral_reason: str = ""
     urgency: str = "routine"
+
+    # Explainability
+    attention_map: torch.Tensor | None = None  # DINOv2 self-attention for GradCAM
 
     # Baseline comparison
     baseline_vcdr_positive: bool | None = None  # vCDR > 0.5 per baseline method
@@ -54,10 +65,10 @@ class ScreeningOutput:
 class ScreeningPipeline:
     """Tier 1 screening: single fundus photo to referral decision.
 
-    Designed for low-resource settings. Uses only:
-      - FunduSAM for optic disc/cup segmentation
-      - RETFound-CFP for deep feature extraction and risk scoring
-      - FIN for fairness normalization (optional)
+    GlaucoMamba architecture — designed for low-resource settings. Uses only:
+      - BoundaryFormer for optic disc/cup segmentation
+      - DINOv2-Base for feature extraction and risk scoring
+      - EquityAttention for fairness (optional)
 
     When baseline_mode=True, uses only vCDR > 0.5 threshold to reproduce
     the PMC12469222 methodology for direct comparison.
@@ -65,10 +76,10 @@ class ScreeningPipeline:
 
     def __init__(
         self,
-        fundusam: Any = None,
-        retfound_cfp: Any = None,
+        segmenter: Any = None,
+        feature_encoder: Any = None,
         classifier_head: Any = None,
-        fair_norm: Any = None,
+        equity_module: Any = None,
         device: str = "cpu",
         referral_threshold: float = 0.5,
         vcdr_alert_threshold: float = 0.65,
@@ -76,20 +87,19 @@ class ScreeningPipeline:
     ) -> None:
         """
         Args:
-            fundusam: FunduSAMSegmenter instance.
-            retfound_cfp: RETFoundEncoder instance (CFP variant).
-            classifier_head: nn.Module mapping [B, 1024] embedding to [B, 1] score.
-                If None, falls back to vCDR-only mode.
-            fair_norm: FairIdentityNormalization instance (optional).
+            segmenter: BoundaryFormer instance for disc/cup segmentation.
+            feature_encoder: DINOv2Encoder instance.
+            classifier_head: nn.Module mapping [B, 768] embedding to [B, 1] score.
+            equity_module: EquityModule instance (optional).
             device: "cpu" (default for screening) or "cuda".
             referral_threshold: Risk score above which to recommend referral.
             vcdr_alert_threshold: vCDR above which to escalate regardless.
             baseline_mode: If True, classify solely on vCDR > 0.5.
         """
-        self.fundusam = fundusam
-        self.retfound_cfp = retfound_cfp
+        self.segmenter = segmenter
+        self.feature_encoder = feature_encoder
         self.classifier_head = classifier_head
-        self.fair_norm = fair_norm
+        self.equity_module = equity_module
         self.device = device
         self.referral_threshold = referral_threshold
         self.vcdr_alert_threshold = vcdr_alert_threshold
@@ -104,7 +114,7 @@ class ScreeningPipeline:
 
         Args:
             fundus_image: Color fundus photograph [1, 3, H, W].
-            demographics: Optional dict with age, sex, race/group_id (for FIN).
+            demographics: Optional dict with age, sex, race/group_id.
 
         Returns:
             ScreeningOutput with risk assessment and referral recommendation.
@@ -112,11 +122,14 @@ class ScreeningPipeline:
         start = time.perf_counter()
         output = ScreeningOutput()
 
-        # Phase 2: Segmentation
-        if self.fundusam is not None:
-            seg = self.fundusam(fundus_image.to(self.device))
-            output.disc_mask = seg[:, 1]
-            output.cup_mask = seg[:, 2]
+        # Segmentation via BoundaryFormer
+        if self.segmenter is not None:
+            seg_output = self.segmenter(fundus_image.to(self.device))
+            logits = seg_output["logits"]
+            pred = logits.argmax(dim=1)
+            output.disc_mask = (pred == 1).float()
+            output.cup_mask = (pred == 2).float()
+            output.boundary_map = seg_output.get("boundary")
             output.vcdr = compute_vcdr(output.disc_mask[0], output.cup_mask[0])
 
         # Always compute baseline comparison
@@ -131,21 +144,29 @@ class ScreeningPipeline:
             if output.refer_to_specialist:
                 output.referral_reason = "vCDR > 0.5 (baseline threshold)"
         else:
-            # Primary method: RETFound features + classifier
-            if self.retfound_cfp is not None:
-                embedding = self.retfound_cfp(fundus_image.to(self.device))
+            # Primary method: DINOv2 features + classifier
+            if self.feature_encoder is not None:
+                embedding = self.feature_encoder(fundus_image.to(self.device))
 
-                # Apply FIN if demographics available
-                if self.fair_norm is not None and demographics and "group_id" in demographics:
+                # Apply equity attention if demographics available
+                if self.equity_module is not None and demographics and "group_id" in demographics:
                     group_id = torch.tensor([demographics["group_id"]], device=self.device)
-                    embedding = self.fair_norm(embedding, group_id)
+                    embedding = self.equity_module(embedding, group_id)
 
                 if self.classifier_head is not None:
                     logits = self.classifier_head(embedding)
                     output.risk_score = float(torch.sigmoid(logits).item())
                 else:
-                    # No classifier head: fall back to vCDR as score
                     output.risk_score = output.vcdr or 0.0
+
+                # Extract attention maps for explainability
+                if hasattr(self.feature_encoder, "get_attention_maps"):
+                    try:
+                        output.attention_map = self.feature_encoder.get_attention_maps(
+                            fundus_image.to(self.device)
+                        )
+                    except Exception:
+                        pass
 
             # Risk classification
             output.risk_level = classify_risk(
@@ -177,11 +198,7 @@ class ScreeningPipeline:
         screening_site: str = "",
         demographics: dict[str, Any] | None = None,
     ) -> ReferralPacket:
-        """Create a referral packet from screening results for Tier 2 intake.
-
-        Artifact paths (masks, embeddings) should be set by the calling script
-        after saving to disk, since path management is deployment-specific.
-        """
+        """Create a referral packet from screening results for Tier 2 intake."""
         return ReferralPacket(
             patient_id=patient_id,
             screening_site=screening_site,
