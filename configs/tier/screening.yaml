@@ -1,0 +1,41 @@
+# Tier 1: Screening deployment configuration
+# Target: Rural clinics, community camps, mobile health
+# Input: Single fundus photograph
+# Latency: <5s CPU, <1s GPU
+
+tier: screening
+
+pipeline:
+  device: cpu
+  baseline_mode: false  # Set true for vCDR-only baseline comparison
+  referral_threshold: 0.5
+  vcdr_alert_threshold: 0.65
+
+segmentation:
+  model: fundusam
+  sam_checkpoint: null  # Path to SAM ViT-H weights
+  num_classes: 3  # background, disc, cup
+  use_polar_transform: true
+  image_size: 512
+
+feature_extraction:
+  model: retfound_cfp
+  checkpoint: null  # Path to RETFound-CFP weights
+  embed_dim: 1024
+  freeze_encoder: true  # Frozen for inference speed
+  image_size: 224
+
+classifier:
+  type: linear
+  input_dim: 1024
+  checkpoint: null  # Path to trained classifier head weights
+
+fairness:
+  enabled: true
+  fin_checkpoint: null
+  num_groups: 3  # Asian, Black, White (per Harvard-GF)
+
+output:
+  save_overlay: true
+  save_referral_json: true
+  output_dir: outputs/screening/

@@ -1,0 +1,59 @@
+# Tier 2: Specialist management deployment configuration
+# Target: Tertiary hospitals with OCT machines
+# Input: Sequential visits with fundus + OCT + VF + clinical data
+# Accepts referrals from Tier 1
+
+tier: specialist
+
+pipeline:
+  device: cuda
+  enable_vlm: false  # Must be explicitly opted in; experimental
+
+segmentation:
+  fundusam:
+    sam_checkpoint: null
+    num_classes: 3
+    use_polar_transform: true
+    image_size: 512
+  medsam2:
+    sam2_checkpoint: null
+    target_structures: [rnfl]
+
+feature_extraction:
+  retfound_cfp:
+    checkpoint: null
+    embed_dim: 1024
+    freeze_encoder: false  # Fine-tune for specialist tasks
+  retfound_oct:
+    checkpoint: null
+    embed_dim: 1024
+    freeze_encoder: false
+
+progression:
+  temporal_encoder:
+    backbone: convnextv2_base
+    pretrained: true
+    embed_dim: 1024
+  forecaster:
+    hidden_dim: 512
+    num_layers: 2
+    dropout: 0.3
+    num_classes: 2  # stable vs progressing
+  observation_window: 4
+  # RNFL is essential (removing: AUC 0.569). VF is redundant (removing: AUC 0.975).
+  primary_modality: rnfl_oct
+
+vlm:
+  model: llava-hf/llava-v1.6-mistral-7b-hf
+  max_new_tokens: 512
+  experimental: true  # Always true — VLMs hallucinate
+
+fairness:
+  enabled: true
+  fin_checkpoint: null
+  num_groups: 3
+  audit_on_run: true
+
+output:
+  save_progression_plot: true
+  output_dir: outputs/specialist/

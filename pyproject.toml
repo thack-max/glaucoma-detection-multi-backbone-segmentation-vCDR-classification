@@ -5,7 +5,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 [project]
 name = "glaucoma-multimodal"
 version = "0.1.0"
-description = "Multimodal glaucoma detection: segmentation, foundation models, progression forecasting, and VLM explainability"
+description = "Two-tier glaucoma pipeline: screening (single fundus) and specialist (multimodal longitudinal progression forecasting)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -41,6 +41,10 @@ vlm = [
     "peft>=0.7",
     "bitsandbytes>=0.41",
 ]
+
+[project.scripts]
+glaucoma-screen = "scripts.run_screening:main"
+glaucoma-specialist = "scripts.run_specialist:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
