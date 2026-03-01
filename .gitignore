@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (do not commit datasets)
+data/
+datasets/
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Model weights
+weights/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# Logs and outputs
+logs/
+outputs/
+runs/
+wandb/
+mlruns/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Environment variables
+.env
+.env.local

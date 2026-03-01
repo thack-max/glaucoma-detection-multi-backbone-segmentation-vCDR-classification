@@ -1,0 +1,1 @@
+from .fair_identity_norm import FairIdentityNormalization

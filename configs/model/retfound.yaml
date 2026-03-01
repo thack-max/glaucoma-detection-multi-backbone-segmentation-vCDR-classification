@@ -1,0 +1,24 @@
+# RETFound configuration — Phase 3 feature extraction
+# Reference: Zhou et al., Nature 622, 156-163 (2023)
+# Weights: https://github.com/rmaphoh/RETFound_MAE
+
+model:
+  name: retfound
+  architecture: vit_large_patch16_224
+  embed_dim: 1024
+
+  cfp:
+    checkpoint: null  # Path to RETFound-CFP weights
+    # Pre-trained on 904K color fundus photographs
+
+  oct:
+    checkpoint: null  # Path to RETFound-OCT weights
+    # Pre-trained on 736K OCT images
+
+  freeze_encoder: false  # Fine-tune for downstream task
+
+data:
+  image_size: 224  # ViT-Large input size
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]

@@ -1,0 +1,37 @@
+# VLM report generator configuration — Phase 5
+# Reference: PMC12641456 (2025) — LLaVA on DIGS/ADAGES
+# AUC 0.92, VF MD MAE 1.79 dB
+
+model:
+  name: llava
+  base_model: llava-hf/llava-v1.6-mistral-7b-hf
+  max_new_tokens: 512
+
+  # Critical: both must be fine-tuned (PMC12641456 finding)
+  finetune_vision_encoder: true
+  finetune_mlp_projector: true
+
+  peft:
+    method: lora
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - v_proj
+
+  quantization:
+    enabled: true
+    bits: 4  # QLoRA
+
+training:
+  epochs: 10
+  batch_size: 2
+  learning_rate: 2.0e-5
+  gradient_accumulation_steps: 8
+
+# WARNING: VLMs are experimental for clinical use
+# - Known to hallucinate medical findings
+# - No FDA clearance for diagnostic report generation
+# - All outputs must be reviewed by a clinician
+experimental: true
