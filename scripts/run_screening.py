@@ -23,6 +23,11 @@ import yaml
 
 from src.data.transforms import get_fundus_transforms
 from src.data.fundus_dataset import _read_image
+from src.models.explainability.gradcam import (
+    AttentionRolloutCAM,
+    DINOv2GradCAM,
+    overlay_heatmap_on_image,
+)
 from src.pipeline.screening import ScreeningPipeline
 
 
@@ -79,12 +84,52 @@ def _try_load_classifier(cfg: dict, device: str):
     return head.to(device)
 
 
+def _save_gradcam_overlay(
+    image_np: np.ndarray,
+    image_tensor: torch.Tensor,
+    pipeline: ScreeningPipeline,
+    output_path: Path,
+) -> bool:
+    """Compute a DINOv2-based explainability heatmap and save an overlay.
+
+    Prefers classifier-aware Grad-CAM when a classifier head is available,
+    otherwise falls back to attention rollout (classifier-free). Returns
+    True if a heatmap was successfully written.
+    """
+    encoder = pipeline.feature_encoder
+    if encoder is None:
+        return False
+
+    try:
+        if pipeline.classifier_head is not None:
+            explainer = DINOv2GradCAM(encoder, pipeline.classifier_head)
+            heatmap = explainer(image_tensor)
+        else:
+            explainer = AttentionRolloutCAM(encoder)
+            heatmap = explainer(image_tensor)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    gradcam failed: {exc}")
+        return False
+
+    heatmap_np = heatmap[0].detach().cpu().numpy()
+    overlay = overlay_heatmap_on_image(image_np, heatmap_np, alpha=0.45)
+
+    try:
+        from PIL import Image
+
+        Image.fromarray(overlay).save(output_path)
+        return True
+    except ImportError:
+        return False
+
+
 def _screen_one(
     pipeline: ScreeningPipeline,
     image_path: Path,
     transform,
     output_dir: Path,
     save_referral: bool = True,
+    save_gradcam: bool = True,
 ) -> dict:
     image_np = _read_image(image_path)
     tensor = transform(image_np)["image"].unsqueeze(0)
@@ -106,6 +151,11 @@ def _screen_one(
     out_json = output_dir / f"{image_path.stem}.json"
     with open(out_json, "w") as f:
         json.dump(record, f, indent=2)
+
+    if save_gradcam and not pipeline.baseline_mode:
+        gradcam_path = output_dir / f"{image_path.stem}_gradcam.png"
+        if _save_gradcam_overlay(image_np, tensor, pipeline, gradcam_path):
+            record["gradcam_path"] = str(gradcam_path.relative_to(output_dir))
 
     if save_referral and result.refer_to_specialist:
         referral = pipeline.create_referral(
