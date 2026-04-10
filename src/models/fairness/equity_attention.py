@@ -10,6 +10,8 @@ knowledge distillation." (FairDist) npj Digital Medicine, 2025.
 
 Also draws from:
   - Harvard Glaucoma Fairness (IEEE TMI, 2024) — FIN baseline
+  - Ganin & Lempitsky, "Unsupervised Domain Adaptation by Backpropagation."
+    ICML 2015 — Gradient Reversal Layer for adversarial learning
   - Group DRO (Sagawa et al., ICLR 2020) — worst-group optimization
 
 Replaces: Fair Identity Normalization (FIN).
@@ -18,6 +20,8 @@ Why Equity Attention over FIN:
   - FIN only normalizes per-group statistics (corrective, not generative)
   - Equity Attention learns to attend to features that are invariant across
     demographic groups, actively producing fairer representations
+  - Adversarial training via Gradient Reversal forces the feature extractor
+    to remove group-discriminative signal
   - Knowledge distillation transfers equity properties to smaller models
   - Validated specifically for glaucoma progression (FairDist paper)
 """
@@ -27,6 +31,30 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class _GradientReversalFunction(torch.autograd.Function):
+    """Identity on the forward pass, negates gradients on the backward pass.
+
+    Introduced by Ganin & Lempitsky (2015). When placed between a feature
+    extractor and a classifier, training that classifier to succeed trains
+    the upstream features to FAIL at that task — i.e. to become invariant
+    to the signal the classifier is trying to predict.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambda_: float) -> torch.Tensor:
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        return grad_output.neg() * ctx.lambda_, None
+
+
+def gradient_reversal(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
+    """Apply a gradient reversal with strength `lambda_` to `x`."""
+    return _GradientReversalFunction.apply(x, lambda_)
 
 
 class EquityAttentionBlock(nn.Module):
@@ -92,20 +120,39 @@ class EquityAttentionBlock(nn.Module):
 
         return weighted
 
-    def get_group_prediction(self, features: torch.Tensor) -> torch.Tensor:
+    def get_group_prediction(
+        self,
+        features: torch.Tensor,
+        reverse_gradient: bool = True,
+        lambda_: float = 1.0,
+    ) -> torch.Tensor:
         """Predict group membership from features (for adversarial training).
 
-        During training, this head is trained to predict demographics.
-        The main model is trained to MINIMIZE this head's accuracy,
-        forcing features to become demographic-invariant.
+        When `reverse_gradient=True` (the default), gradients flowing from
+        the group predictor back into `features` are negated via a Gradient
+        Reversal Layer. Training the group predictor to succeed therefore
+        pushes the feature extractor to produce demographic-invariant
+        representations — exactly the FairDist objective.
+
+        When `reverse_gradient=False`, the features are detached and only
+        the group predictor itself is updated. This is useful if you want
+        to alternate discriminator and generator steps explicitly.
 
         Args:
             features: [B, feature_dim].
+            reverse_gradient: If True (default), insert a GRL so a single
+                backward pass trains both the predictor and the feature
+                extractor adversarially.
+            lambda_: Strength of the reversed gradient.
 
         Returns:
             Group logits [B, num_groups].
         """
-        return self.group_predictor(features.detach())
+        if reverse_gradient:
+            features = gradient_reversal(features, lambda_)
+        else:
+            features = features.detach()
+        return self.group_predictor(features)
 
 
 class KnowledgeDistillationLoss(nn.Module):
@@ -198,20 +245,32 @@ class EquityModule(nn.Module):
         self,
         features: torch.Tensor,
         group_ids: torch.Tensor,
+        reverse_gradient: bool = True,
     ) -> torch.Tensor:
         """Compute adversarial loss for fairness regularization.
 
-        Maximizing this loss makes features less predictive of demographics.
-        Use with gradient reversal during training.
+        By default this wires the features through a Gradient Reversal Layer
+        so that adding `adversarial_loss(...)` to the main classification
+        loss and calling `.backward()` once trains:
+
+          - the group predictor to MINIMIZE cross-entropy on group labels
+          - the feature extractor to MAXIMIZE it (because gradients are
+            reversed before reaching the features)
+
+        Setting `reverse_gradient=False` recovers the old behavior of
+        training the predictor in isolation (useful for a warm-up phase).
 
         Args:
             features: [B, feature_dim] (after equity attention).
             group_ids: [B] true group labels.
+            reverse_gradient: Whether to insert the GRL (default True).
 
         Returns:
-            Adversarial loss (cross-entropy for group prediction).
+            Weighted adversarial cross-entropy loss.
         """
-        group_logits = self.equity_attn.get_group_prediction(features)
+        group_logits = self.equity_attn.get_group_prediction(
+            features, reverse_gradient=reverse_gradient, lambda_=1.0,
+        )
         return self.adversarial_weight * F.cross_entropy(group_logits, group_ids)
 
     def equity_gap(

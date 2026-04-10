@@ -4,7 +4,14 @@ import numpy as np
 import torch
 import pytest
 
-from src.evaluation.metrics import dice_coefficient, iou_score, compute_auc
+from src.evaluation.metrics import (
+    binary_classification_metrics,
+    compute_auc,
+    dice_coefficient,
+    iou_score,
+    sensitivity_at_specificity,
+    specificity_at_sensitivity,
+)
 
 
 def test_dice_perfect_overlap():
@@ -64,3 +71,37 @@ def test_auc_random():
     scores = np.random.rand(1000)
     auc = compute_auc(labels, scores)
     assert 0.4 < auc < 0.6  # Should be near 0.5 for random
+
+
+def test_sensitivity_at_specificity_perfect():
+    labels = np.array([0, 0, 0, 1, 1, 1])
+    scores = np.array([0.1, 0.2, 0.3, 0.7, 0.8, 0.9])
+    sens = sensitivity_at_specificity(labels, scores, 0.95)
+    assert sens == pytest.approx(1.0)
+
+
+def test_specificity_at_sensitivity_perfect():
+    labels = np.array([0, 0, 0, 1, 1, 1])
+    scores = np.array([0.1, 0.2, 0.3, 0.7, 0.8, 0.9])
+    spec = specificity_at_sensitivity(labels, scores, 0.90)
+    assert spec == pytest.approx(1.0)
+
+
+def test_binary_classification_metrics_perfect():
+    labels = np.array([0, 0, 1, 1])
+    scores = np.array([0.1, 0.2, 0.8, 0.9])
+    m = binary_classification_metrics(labels, scores, threshold=0.5)
+    assert m["accuracy"] == 1.0
+    assert m["sensitivity"] == 1.0
+    assert m["specificity"] == 1.0
+    assert m["tp"] == 2
+    assert m["tn"] == 2
+
+
+def test_binary_classification_metrics_all_wrong():
+    labels = np.array([0, 0, 1, 1])
+    scores = np.array([0.9, 0.8, 0.1, 0.2])
+    m = binary_classification_metrics(labels, scores, threshold=0.5)
+    assert m["accuracy"] == 0.0
+    assert m["sensitivity"] == 0.0
+    assert m["specificity"] == 0.0

@@ -320,3 +320,48 @@ class TestEquityModule:
         gap = module.equity_gap(predictions, targets, groups)
         assert "equity_gap" in gap
         assert "min_group_acc" in gap
+
+
+class TestGradientReversal:
+    def test_forward_is_identity(self):
+        from src.models.fairness.equity_attention import gradient_reversal
+        x = torch.randn(4, 8)
+        out = gradient_reversal(x, lambda_=1.0)
+        assert torch.allclose(out, x)
+
+    def test_backward_reverses_gradient(self):
+        from src.models.fairness.equity_attention import gradient_reversal
+        x = torch.randn(4, 8, requires_grad=True)
+        out = gradient_reversal(x, lambda_=2.0)
+        out.sum().backward()
+        # Reversed gradient of sum(x) w.r.t. x is -1 * lambda_ per element
+        assert torch.allclose(x.grad, torch.full_like(x, -2.0))
+
+    def test_adversarial_loss_with_grl_updates_features(self):
+        """Verify that the GRL path actually pushes gradients back to features."""
+        from src.models.fairness.equity_attention import EquityModule
+
+        torch.manual_seed(0)
+        module = EquityModule(feature_dim=16, num_groups=3, adversarial_weight=1.0)
+        features = torch.randn(6, 16, requires_grad=True)
+        groups = torch.tensor([0, 1, 2, 0, 1, 2])
+
+        loss = module.adversarial_loss(features, groups, reverse_gradient=True)
+        loss.backward()
+
+        assert features.grad is not None
+        # GRL should leave a non-zero gradient on the input features.
+        assert features.grad.abs().sum() > 0
+
+    def test_adversarial_loss_without_grl_detaches(self):
+        from src.models.fairness.equity_attention import EquityModule
+
+        module = EquityModule(feature_dim=16, num_groups=3)
+        features = torch.randn(6, 16, requires_grad=True)
+        groups = torch.tensor([0, 1, 2, 0, 1, 2])
+
+        loss = module.adversarial_loss(features, groups, reverse_gradient=False)
+        loss.backward()
+
+        # With detach, no gradient should reach the upstream features.
+        assert features.grad is None or features.grad.abs().sum() == 0
