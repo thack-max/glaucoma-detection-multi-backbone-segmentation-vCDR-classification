@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from src.data.fundus_dataset import FundusDataset
 from src.data.transforms import get_fundus_transforms
@@ -46,9 +47,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output", type=str, default="checkpoints/screening_classifier.pth")
     return parser.parse_args()
+
+
+def _run_epoch(
+    encoder: DINOv2Encoder,
+    classifier: ClassifierHead,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer | None,
+    criterion: nn.BCEWithLogitsLoss,
+    device: torch.device,
+) -> tuple[float, float]:
+    if optimizer is None:
+        classifier.eval()
+    else:
+        classifier.train()
+
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch.get("label")
+        if labels is None:
+            continue
+        labels = labels.float().to(device)
+
+        with torch.no_grad():
+            feats = encoder(images)
+
+        logits = classifier(feats)
+        loss = criterion(logits, labels)
+
+        if optimizer is not None:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        total_loss += float(loss.item()) * labels.shape[0]
+        preds = (torch.sigmoid(logits) > 0.5).float()
+        correct += int((preds == labels).sum().item())
+        total += labels.shape[0]
+
+    if total == 0:
+        return 0.0, 0.0
+    return total_loss / total, correct / total
 
 
 def main():
@@ -56,7 +103,6 @@ def main():
     device = torch.device(args.device)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
-    # Load frozen DINOv2 encoder
     encoder = DINOv2Encoder(
         variant=args.dinov2_variant,
         freeze_encoder=True,
@@ -64,22 +110,48 @@ def main():
     encoder.eval()
 
     embed_dim = encoder.embed_dim
-
-    # Classifier head (only trainable parameters)
     classifier = ClassifierHead(input_dim=embed_dim).to(device)
     optimizer = torch.optim.Adam(classifier.parameters(), lr=args.lr)
     criterion = nn.BCEWithLogitsLoss()
 
-    print(f"DINOv2 encoder: {args.dinov2_variant} frozen ({sum(p.numel() for p in encoder.parameters()):,} params)")
-    print(f"Classifier head: {sum(p.numel() for p in classifier.parameters()):,} trainable params")
-    print(f"Embedding dim: {embed_dim}")
-    print(f"Device: {device}")
+    train_transform = get_fundus_transforms("train", image_size=args.image_size)
+    val_transform = get_fundus_transforms("val", image_size=args.image_size)
+    train_ds = FundusDataset(args.data_root, split="train", transform=train_transform)
+    val_ds = FundusDataset(args.data_root, split="val", transform=val_transform)
 
-    # TODO: Load dataset with labels, extract embeddings, train classifier
-    # transform = get_fundus_transforms("train", image_size=224)
-    # train_ds = FundusDataset(args.data_root, split="train", transform=transform)
-    print(f"\nDataset required for training.")
-    print(f"DINOv2 weights will auto-download from torch.hub on first use.")
+    print(f"DINOv2 encoder: {args.dinov2_variant} frozen ({embed_dim} dim)")
+    print(f"Classifier: {sum(p.numel() for p in classifier.parameters()):,} trainable params")
+    print(f"Device: {device}")
+    print(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
+
+    if len(train_ds) == 0:
+        print("\nEmpty training set. See src/data/fundus_dataset.py for manifest format.")
+        return
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2) if len(val_ds) else None
+
+    best_acc = 0.0
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = _run_epoch(encoder, classifier, train_loader, optimizer, criterion, device)
+        msg = f"Epoch {epoch:03d} | train loss {train_loss:.4f} acc {train_acc:.3f}"
+
+        if val_loader is not None:
+            val_loss, val_acc = _run_epoch(encoder, classifier, val_loader, None, criterion, device)
+            msg += f" | val loss {val_loss:.4f} acc {val_acc:.3f}"
+
+            if val_acc > best_acc:
+                best_acc = val_acc
+                torch.save(
+                    {"classifier": classifier.state_dict(), "epoch": epoch, "val_acc": val_acc},
+                    args.output,
+                )
+
+        print(msg)
+
+    if val_loader is None:
+        torch.save({"classifier": classifier.state_dict()}, args.output)
+    print(f"\nSaved to: {args.output}")
 
 
 if __name__ == "__main__":

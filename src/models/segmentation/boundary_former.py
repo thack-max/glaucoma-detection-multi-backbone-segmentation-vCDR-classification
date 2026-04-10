@@ -213,11 +213,13 @@ class BoundaryFormer(nn.Module):
             nn.GELU(),
         )
 
-        # Decoder path — boundary attention at every level
-        self.dec4 = DecoderBlock(ch * 16, ch * 8, ch * 8, use_boundary_att=True)
-        self.dec3 = DecoderBlock(ch * 8, ch * 4, ch * 4, use_boundary_att=True)
-        self.dec2 = DecoderBlock(ch * 4, ch * 2, ch * 2, use_boundary_att=True)
-        self.dec1 = DecoderBlock(ch * 2, ch, ch, use_boundary_att=True)
+        # Decoder path — boundary attention at every level.
+        # Skip connections come from the encoder transition outputs, which
+        # match the encoder's out_channels at each level.
+        self.dec4 = DecoderBlock(ch * 16, ch * 16, ch * 8, use_boundary_att=True)
+        self.dec3 = DecoderBlock(ch * 8, ch * 8, ch * 4, use_boundary_att=True)
+        self.dec2 = DecoderBlock(ch * 4, ch * 4, ch * 2, use_boundary_att=True)
+        self.dec1 = DecoderBlock(ch * 2, ch * 2, ch, use_boundary_att=True)
 
         # Segmentation head
         self.seg_head = nn.Conv2d(ch, num_classes, 1)

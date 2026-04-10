@@ -207,6 +207,37 @@ class SpecialistPipeline:
                 vf_data.to(self.device)
             )
 
+        # --- Multimodal fusion (current visit) ---
+
+        if self.fusion_module is not None:
+            modality_feats: dict[str, torch.Tensor] = {}
+            if output.dinov2_fundus_embedding is not None:
+                modality_feats["fundus"] = output.dinov2_fundus_embedding
+            if output.dinov2_oct_embedding is not None:
+                modality_feats["oct"] = output.dinov2_oct_embedding
+            if output.vf_classification is not None:
+                # Use the logits as a compact VF feature
+                modality_feats["vf"] = output.vf_classification
+            if clinical_data is not None:
+                clin_vec = torch.tensor(
+                    [
+                        float(clinical_data.get("iop", 0.0)),
+                        float(clinical_data.get("age", 0.0)),
+                        float(clinical_data.get("sex", 0.0)),
+                    ],
+                    device=self.device,
+                ).unsqueeze(0)
+                modality_feats["clinical"] = clin_vec
+
+            if modality_feats:
+                try:
+                    fused = self.fusion_module(modality_feats, return_uncertainty=True)
+                    if isinstance(fused, dict):
+                        output.fusion_uncertainty = fused.get("std")
+                except (RuntimeError, KeyError):
+                    # Fused modules may require a strict subset of modalities
+                    pass
+
         # --- Progression forecasting ---
 
         if (
@@ -215,9 +246,41 @@ class SpecialistPipeline:
             and self.forecaster is not None
         ):
             # Encode visit sequence with timestamps for irregular interval handling
-            # visit_features: [1, T, feature_dim] from DINOv2 on each visit's image
-            # The calling script is responsible for stacking visit features
-            pass
+            visit_features = self._stack_visit_features(visit_history)
+            if visit_features is not None:
+                if timestamps is None:
+                    timestamps = self._default_timestamps(visit_features.shape[1])
+                visit_features = visit_features.to(self.device)
+                timestamps = timestamps.to(self.device)
+
+                temporal_embedding = self.temporal_encoder(visit_features, timestamps)
+
+                # Optional clinical + VF auxiliary features for the forecaster
+                clinical_features = None
+                if clinical_data is not None:
+                    clinical_features = torch.tensor(
+                        [
+                            float(clinical_data.get("iop", 0.0)),
+                            float(clinical_data.get("age", 0.0)),
+                            float(clinical_data.get("sex", 0.0)),
+                        ],
+                        device=self.device,
+                    ).unsqueeze(0)
+
+                vf_features = None
+                if output.vf_classification is not None:
+                    vf_features = output.vf_classification
+
+                try:
+                    forecast = self.forecaster(
+                        temporal_embedding,
+                        clinical_features=clinical_features,
+                        vf_features=vf_features,
+                    )
+                except TypeError:
+                    forecast = self.forecaster(temporal_embedding)
+
+                self._populate_forecast(output, forecast)
 
         # --- VLM clinical reporting (experimental, gated) ---
 
@@ -244,6 +307,75 @@ class SpecialistPipeline:
                 output.clinical_report = None
 
         return output
+
+    # ------------------------------------------------------------------
+    # Progression forecasting helpers
+    # ------------------------------------------------------------------
+
+    def _stack_visit_features(
+        self, visit_history: list[dict]
+    ) -> torch.Tensor | None:
+        """Stack per-visit features into a [1, T, D] tensor.
+
+        Each visit dict may provide either:
+          - 'features': precomputed DINOv2 embedding [D] or [1, D], or
+          - 'fundus': a raw image tensor [1, 3, H, W] that we encode on the fly.
+        """
+        if not visit_history:
+            return None
+
+        feats: list[torch.Tensor] = []
+        for visit in visit_history:
+            if "features" in visit and visit["features"] is not None:
+                f = visit["features"]
+                if f.ndim == 1:
+                    f = f.unsqueeze(0)
+                feats.append(f)
+                continue
+            if self.feature_encoder is not None and "fundus" in visit:
+                img = visit["fundus"].to(self.device)
+                feats.append(self.feature_encoder(img))
+
+        if not feats:
+            return None
+        # [T, D] -> [1, T, D]
+        return torch.stack(feats, dim=1) if feats[0].ndim == 2 else torch.stack(feats).unsqueeze(0)
+
+    @staticmethod
+    def _default_timestamps(num_visits: int) -> torch.Tensor:
+        """Assume uniform 90-day visit spacing when no timestamps are provided."""
+        return torch.arange(num_visits, dtype=torch.float32).mul_(90.0).unsqueeze(0)
+
+    @staticmethod
+    def _populate_forecast(
+        output: SpecialistOutput,
+        forecast: dict[str, dict[str, torch.Tensor]],
+    ) -> None:
+        """Write forecaster outputs into the SpecialistOutput dataclass."""
+        cls = forecast.get("classification") if isinstance(forecast, dict) else None
+        if cls is not None and "prob" in cls:
+            prob = cls["prob"]
+            # Probability of the progressing class (index 1)
+            if prob.ndim == 2 and prob.shape[-1] >= 2:
+                output.progression_probability = float(prob[0, 1].item())
+                # Human-readable class label based on probability buckets
+                p = output.progression_probability
+                if p < 0.3:
+                    output.progression_class = "stable"
+                elif p < 0.7:
+                    output.progression_class = "slow"
+                else:
+                    output.progression_class = "rapid"
+            if "uncertainty" in cls and cls["uncertainty"] is not None:
+                output.progression_uncertainty = float(cls["uncertainty"][0].item())
+
+        reg = forecast.get("regression") if isinstance(forecast, dict) else None
+        if reg is not None and "mu" in reg:
+            output.predicted_rnfl_thickness = float(reg["mu"][0].item())
+            if "aleatoric" in reg:
+                output.rnfl_aleatoric_uncertainty = float(reg["aleatoric"][0].item())
+            if "epistemic" in reg:
+                output.rnfl_epistemic_uncertainty = float(reg["epistemic"][0].item())
 
     def ingest_referral(self, referral: ReferralPacket) -> dict[str, Any]:
         """Inspect a Tier 1 referral and plan what Tier 2 still needs to do."""

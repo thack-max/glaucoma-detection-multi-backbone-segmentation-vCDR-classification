@@ -206,40 +206,62 @@ class CrossModalFusion(nn.Module):
 
         Args:
             modality_features: Dict of {name: [B, dim]} feature tensors.
+                              Missing modalities are padded with zero vectors
+                              so that the gating network always sees the same
+                              number of inputs it was initialized with.
 
         Returns:
             Fused representation [B, fused_dim].
         """
-        # Project all modalities to common dimension
-        projected = {}
+        if not modality_features:
+            raise ValueError("At least one modality must be provided")
+
+        # Determine batch size from any present modality
+        batch_size = next(iter(modality_features.values())).shape[0]
+        device = next(iter(modality_features.values())).device
+
+        # Project every configured modality. Missing ones become zero vectors
+        # in the fused space so that downstream layers keep a fixed shape.
+        projected: dict[str, torch.Tensor] = {}
+        present_mask: list[bool] = []
         for name in self.modality_names:
             if name in modality_features:
                 projected[name] = self.projections[name](modality_features[name])
+                present_mask.append(True)
+            else:
+                projected[name] = torch.zeros(
+                    batch_size, self.fused_dim, device=device,
+                )
+                present_mask.append(False)
 
-        active_names = list(projected.keys())
-        if not active_names:
-            raise ValueError("At least one modality must be provided")
-
-        # Self-attention per modality
-        enhanced = {}
-        for name in active_names:
+        # Self-attention per modality (applied uniformly, including zero slots
+        # so that the computation graph matches self.modality_names exactly).
+        enhanced: dict[str, torch.Tensor] = {}
+        for name in self.modality_names:
             x = projected[name].unsqueeze(1)  # [B, 1, dim]
             enhanced[name] = self.self_attns[name](x).squeeze(1)
 
-        # Cross-modal attention
-        # Stack all modalities as context
-        context = torch.stack([enhanced[n] for n in active_names], dim=1)  # [B, M, dim]
+        # Cross-modal attention against the full context
+        context = torch.stack(
+            [enhanced[n] for n in self.modality_names], dim=1,
+        )  # [B, M, dim]
 
-        cross_attended = []
-        for name in active_names:
-            query = enhanced[name].unsqueeze(1)  # [B, 1, dim]
+        cross_attended: list[torch.Tensor] = []
+        for name in self.modality_names:
+            query = enhanced[name].unsqueeze(1)
             attended = self.cross_attns[name](query, context).squeeze(1)
             cross_attended.append(attended)
 
-        # Dynamic gating
+        # Dynamic gating — zero-masked modalities get their gate weight zeroed
+        # out after the softmax, then we renormalize so the remaining weights
+        # still sum to 1.
         gates = self.gating(cross_attended)  # [B, M]
+        mask = torch.tensor(present_mask, device=gates.device, dtype=gates.dtype)
+        mask = mask.unsqueeze(0).expand_as(gates)  # [B, M]
+        masked_gates = gates * mask
+        norm = masked_gates.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        gates = masked_gates / norm
 
-        # Weighted combination
         stacked = torch.stack(cross_attended, dim=1)  # [B, M, dim]
         fused = (stacked * gates.unsqueeze(-1)).sum(dim=1)  # [B, dim]
 
