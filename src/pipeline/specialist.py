@@ -23,12 +23,19 @@ All VLM outputs are always marked experimental with mandatory human review.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from src.pipeline.common import ReferralPacket, compute_vcdr
+
+try:
+    from src.models.vlm.llama_vision_reporter import VLMNotConfiguredError
+except ImportError:  # pragma: no cover - fallback if VLM module refactors
+    class VLMNotConfiguredError(RuntimeError):
+        """Placeholder when the VLM module can't be imported at all."""
 
 
 @dataclass
@@ -134,6 +141,20 @@ class SpecialistPipeline:
         self.equity_module = equity_module
         self.device = device
         self.enable_vlm = enable_vlm
+        # Only emit the "VLM unavailable" warning the first time we hit
+        # an unconfigured reporter so real patient batches don't spam
+        # the operator log once per patient.
+        self._vlm_warned: bool = False
+
+        # If the caller explicitly enabled VLM but provided no generator
+        # instance, flag that up front rather than silently disabling it.
+        if enable_vlm and report_generator is None:
+            warnings.warn(
+                "SpecialistPipeline: enable_vlm=True but no report_generator "
+                "was provided. VLM clinical reports will be disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def run(
         self,
@@ -329,7 +350,21 @@ class SpecialistPipeline:
                 )
                 output.clinical_report = report.raw_text
                 output.vlm_report_is_experimental = True
-            except (NotImplementedError, RuntimeError):
+            except VLMNotConfiguredError as exc:
+                # Expected failure: VLM stack isn't installed or the
+                # Llama weights aren't downloadable. Warn once per
+                # pipeline instance and continue. The rest of the
+                # specialist assessment is still valid.
+                if not self._vlm_warned:
+                    warnings.warn(
+                        f"VLM report generation disabled: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self._vlm_warned = True
+                output.clinical_report = None
+            except NotImplementedError:
+                # Stub reporters used by tests.
                 output.clinical_report = None
 
         return output

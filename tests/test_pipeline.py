@@ -144,7 +144,16 @@ class TestSpecialistPipeline:
         assert pipeline.enable_vlm is False
 
     def test_vlm_explicit_enable(self):
-        pipeline = SpecialistPipeline(device="cpu", enable_vlm=True)
+        # The construction warning about "enable_vlm=True but no
+        # report_generator" is *intentional* — this test is only
+        # checking that the flag itself is honoured, not that a full
+        # reporter is wired up. Filter it so the test stays clean.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*no report_generator.*", category=RuntimeWarning,
+            )
+            pipeline = SpecialistPipeline(device="cpu", enable_vlm=True)
         assert pipeline.enable_vlm is True
 
     def test_ingest_referral(self):

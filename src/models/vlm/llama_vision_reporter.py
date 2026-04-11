@@ -30,6 +30,22 @@ import torch
 import torch.nn as nn
 
 
+class VLMNotConfiguredError(RuntimeError):
+    """Raised when the VLM report generator cannot be used at runtime.
+
+    This is an *expected* failure mode, distinct from a genuine bug: the
+    ``[vlm]`` extras aren't installed, the Llama 3.2 Vision weights
+    aren't downloadable, or the user hasn't accepted the Llama license.
+    Pipelines that gate VLM reports behind ``enable_vlm=True`` should
+    catch this specifically and degrade to "no report" without aborting
+    the rest of the assessment.
+
+    Subclassing ``RuntimeError`` preserves backwards compatibility with
+    callers that previously caught ``RuntimeError`` from
+    ``_ensure_loaded``.
+    """
+
+
 @dataclass
 class ClinicalReport:
     """Structured output from the VLM report generator."""
@@ -105,26 +121,66 @@ class LlamaVisionReporter(nn.Module):
         self.load_in_4bit = load_in_4bit
         self._model = None
         self._processor = None
+        self._load_error: Exception | None = None
+
+    def is_available(self) -> bool:
+        """Cheap probe: can ``generate_report`` actually run right now?
+
+        Tries a lazy-load once and caches the result. Safe to call
+        from configuration code or health checks before committing to
+        enabling the VLM path on a patient.
+        """
+        if self._model is not None:
+            return True
+        if self._load_error is not None:
+            return False
+        try:
+            self._ensure_loaded()
+        except VLMNotConfiguredError:
+            return False
+        return self._model is not None
 
     def _ensure_loaded(self) -> None:
-        """Lazy-load the model on first use."""
+        """Lazy-load the model on first use.
+
+        Raises ``VLMNotConfiguredError`` when the VLM stack is
+        unavailable (``transformers`` missing, weights inaccessible,
+        license not accepted, etc.). The cached error state means
+        subsequent calls fail fast without re-probing HuggingFace.
+        """
         if self._model is not None:
             return
+        if self._load_error is not None:
+            raise VLMNotConfiguredError(
+                f"Llama 3.2 Vision previously failed to load: {self._load_error}"
+            ) from self._load_error
 
         try:
-            from transformers import MllamaForConditionalGeneration, AutoProcessor
+            from transformers import (  # type: ignore[import-untyped]
+                AutoProcessor,
+                MllamaForConditionalGeneration,
+            )
+        except ImportError as e:
+            self._load_error = e
+            raise VLMNotConfiguredError(
+                "Llama 3.2 Vision requires transformers>=4.45. "
+                "Install with: pip install -e '.[vlm]'"
+            ) from e
 
-            quantization_config = None
-            if self.load_in_4bit:
-                try:
-                    from transformers import BitsAndBytesConfig
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                    )
-                except ImportError:
-                    pass
+        quantization_config = None
+        if self.load_in_4bit:
+            try:
+                from transformers import BitsAndBytesConfig  # type: ignore[import-untyped]
 
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+            except ImportError:
+                # 4-bit is optional; fall back to fp16 without bitsandbytes.
+                pass
+
+        try:
             self._model = MllamaForConditionalGeneration.from_pretrained(
                 self.model_name,
                 quantization_config=quantization_config,
@@ -132,18 +188,13 @@ class LlamaVisionReporter(nn.Module):
                 device_map="auto",
             )
             self._processor = AutoProcessor.from_pretrained(self.model_name)
-
-        except ImportError:
-            raise ImportError(
-                "Llama 3.2 Vision requires transformers>=4.45. "
-                "Install with: pip install -e '.[vlm]'"
-            )
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to load {self.model_name}. "
-                f"Ensure you have accepted the Llama license and logged in: "
+            self._load_error = e
+            raise VLMNotConfiguredError(
+                f"Failed to load {self.model_name}. Ensure you have "
+                f"accepted the Llama license and logged in: "
                 f"huggingface-cli login. Error: {e}"
-            )
+            ) from e
 
     def generate_report(
         self,
