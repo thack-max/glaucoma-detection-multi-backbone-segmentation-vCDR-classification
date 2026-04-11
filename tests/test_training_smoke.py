@@ -25,6 +25,7 @@ to end.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import subprocess
@@ -34,6 +35,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from scripts.make_synthetic_longitudinal import generate as generate_longitudinal
 from scripts.make_synthetic_refuge import generate
 from src.models.segmentation.boundary_former import BoundaryFormer
 
@@ -240,6 +242,242 @@ class TestRunScreeningCliWithTrainedCheckpoint:
         assert "risk_score" in rec
         assert "vcdr" in rec
         assert rec["risk_level"] in {"low", "moderate", "high"}
+
+
+@pytest.fixture(scope="module")
+def synthetic_longitudinal_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Materialise a tiny longitudinal dataset under a module-scoped tmp
+    path and return the root. Shared across the Tier 2 smoke tests."""
+    root = tmp_path_factory.mktemp("synthetic_longitudinal")
+    generate_longitudinal(
+        output=root,
+        num_patients=4,
+        num_visits=4,
+        fundus_size=32,
+        oct_shape=(4, 8, 8),
+        seed=0,
+    )
+    return root
+
+
+class TestSyntheticLongitudinalFixture:
+    """Basic contract checks for make_synthetic_longitudinal.py."""
+
+    def test_manifest_matches_multimodal_schema(
+        self, synthetic_longitudinal_root: Path,
+    ) -> None:
+        manifest = synthetic_longitudinal_root / "manifest.csv"
+        assert manifest.exists()
+        with open(manifest) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        expected_columns = {
+            "patient_id", "visit_index", "timestamp_days",
+            "fundus_path", "oct_path", "vf_path",
+            "rnfl_thickness", "iop", "age", "sex",
+            "group_id", "progression_label",
+        }
+        assert rows
+        assert expected_columns.issubset(set(rows[0].keys()))
+
+        # Every referenced artefact must actually exist.
+        for row in rows:
+            assert (synthetic_longitudinal_root / row["fundus_path"]).is_file()
+            assert (synthetic_longitudinal_root / row["oct_path"]).is_file()
+            assert (synthetic_longitudinal_root / row["vf_path"]).is_file()
+
+    def test_multimodal_dataset_loads_fixture(
+        self, synthetic_longitudinal_root: Path,
+    ) -> None:
+        """The fixture must round-trip through MultimodalGlaucomaDataset
+        and produce tensors of the shape the training script expects."""
+        from src.data.multimodal_dataset import MultimodalGlaucomaDataset
+
+        ds = MultimodalGlaucomaDataset(
+            synthetic_longitudinal_root,
+            observation_window=4,
+        )
+        assert len(ds) == 4  # num_patients
+
+        sample = ds[0]
+        # fundus: [T, 3, H, W]
+        assert sample["fundus"].shape == (4, 3, 32, 32)
+        # oct: [T, 1, D, H, W]
+        assert sample["oct"].shape == (4, 1, 4, 8, 8)
+        # vf: [T, 54, 3]
+        assert sample["vf"].shape == (4, 54, 3)
+        # timestamps: [T]
+        assert sample["timestamps"].shape == (4,)
+        # Timestamps must be strictly monotone within a patient
+        diffs = sample["timestamps"][1:] - sample["timestamps"][:-1]
+        assert (diffs > 0).all()
+        # Progression target present
+        assert "progression_label" in sample
+        assert "rnfl_target" in sample
+
+    def test_progression_labels_balance_across_patients(
+        self, synthetic_longitudinal_root: Path,
+    ) -> None:
+        with open(synthetic_longitudinal_root / "manifest.csv") as f:
+            rows = list(csv.DictReader(f))
+        labels_per_patient = {}
+        for row in rows:
+            labels_per_patient[row["patient_id"]] = int(row["progression_label"])
+        labels = list(labels_per_patient.values())
+        assert labels.count(0) == labels.count(1), (
+            f"expected balanced progression labels, got {labels}"
+        )
+
+    def test_progressing_patients_have_lower_final_rnfl(
+        self, synthetic_longitudinal_root: Path,
+    ) -> None:
+        """Essential for the upcoming progression training smoke test to
+        actually have signal: the regression target must differ between
+        progressing and stable patients."""
+        with open(synthetic_longitudinal_root / "manifest.csv") as f:
+            rows = list(csv.DictReader(f))
+
+        by_patient: dict[str, list[tuple[float, float, int]]] = {}
+        for row in rows:
+            by_patient.setdefault(row["patient_id"], []).append(
+                (
+                    float(row["timestamp_days"]),
+                    float(row["rnfl_thickness"]),
+                    int(row["progression_label"]),
+                ),
+            )
+
+        final_rnfl_progressing: list[float] = []
+        final_rnfl_stable: list[float] = []
+        for visits in by_patient.values():
+            visits.sort(key=lambda v: v[0])
+            final_rnfl = visits[-1][1]
+            label = visits[-1][2]
+            (final_rnfl_progressing if label == 1 else final_rnfl_stable).append(
+                final_rnfl,
+            )
+
+        assert final_rnfl_progressing and final_rnfl_stable
+        mean_prog = sum(final_rnfl_progressing) / len(final_rnfl_progressing)
+        mean_stable = sum(final_rnfl_stable) / len(final_rnfl_stable)
+        # Stable patients should end with a higher RNFL than progressing
+        # patients (at least 1 µm separation). If this fails, the
+        # synthetic generator's progression bias is no longer meaningful.
+        assert mean_stable - mean_prog > 1.0, (
+            f"stable mean {mean_stable:.2f} should exceed progressing "
+            f"mean {mean_prog:.2f} by at least 1 µm"
+        )
+
+
+class TestTrainProgressionInProcess:
+    """In-process smoke test for ``train_progression.py``.
+
+    Like the classifier test, we monkey-patch ``DINOv2Encoder`` in the
+    script module to keep the runtime in the seconds range. The point
+    is to exercise the training loop + checkpoint path, not to verify
+    DINOv2 features.
+    """
+
+    def test_progression_training_loop_produces_checkpoint(
+        self,
+        tmp_path: Path,
+        synthetic_longitudinal_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import torch.nn as nn
+
+        import scripts.train_progression as tp
+
+        class _StubEncoder(nn.Module):
+            """Deterministic stand-in for DINOv2Encoder.
+
+            Emits 16-dim features per image. Training script flattens
+            ``[B, T]`` to ``[B*T]`` and calls ``encoder(...)`` under
+            ``no_grad``, so this just needs a fast forward.
+            """
+
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__()
+                self.embed_dim = 16
+                self.proj = nn.Conv2d(3, self.embed_dim, 3, padding=1)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return nn.functional.adaptive_avg_pool2d(
+                    self.proj(x), 1,
+                ).flatten(1)
+
+            def eval(self) -> "_StubEncoder":  # type: ignore[override]
+                return super().eval()  # type: ignore[return-value]
+
+            def to(self, *args, **kwargs) -> "_StubEncoder":  # type: ignore[override]
+                return super().to(*args, **kwargs)  # type: ignore[return-value]
+
+        monkeypatch.setattr(tp, "DINOv2Encoder", _StubEncoder)
+
+        output_dir = tmp_path / "progression_ckpt"
+        monkeypatch.setattr(
+            sys, "argv",
+            [
+                "train_progression.py",
+                "--data-root", str(synthetic_longitudinal_root),
+                "--epochs", "1",
+                "--batch-size", "2",
+                "--lr", "1e-3",
+                "--d-model", "16",
+                "--d-state", "4",
+                "--mamba-layers", "1",
+                "--observation-window", "4",
+                "--clinical-dim", "3",
+                "--num-classes", "2",
+                "--device", "cpu",
+                "--output-dir", str(output_dir),
+            ],
+        )
+
+        tp.main()
+
+        checkpoint = output_dir / "best.pth"
+        assert checkpoint.exists(), "train_progression.py did not emit best.pth"
+        state = torch.load(checkpoint, map_location="cpu")
+        assert "mamba" in state
+        assert "forecaster" in state
+        # The args dict is used to reconstruct the model at inference.
+        assert state["args"]["d_model"] == 16
+        assert state["args"]["observation_window"] == 4
+
+    def test_encode_visits_handles_synthetic_fundus_shape(
+        self,
+        synthetic_longitudinal_root: Path,
+    ) -> None:
+        """The encode_visits helper flattens [B, T, 3, H, W] -> [B*T, ...]
+        before calling the frozen encoder. Regression test that a real
+        batch from the synthetic dataset runs through it cleanly."""
+        from torch.utils.data import DataLoader
+
+        from src.data.multimodal_dataset import MultimodalGlaucomaDataset
+        from scripts.train_progression import encode_visits
+
+        class _StubEncoder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embed_dim = 8
+                self.proj = torch.nn.Conv2d(3, 8, 3, padding=1)
+
+            def forward(self, x):
+                return torch.nn.functional.adaptive_avg_pool2d(
+                    self.proj(x), 1,
+                ).flatten(1)
+
+        encoder = _StubEncoder()
+        ds = MultimodalGlaucomaDataset(
+            synthetic_longitudinal_root, observation_window=4,
+        )
+        loader = DataLoader(ds, batch_size=2, shuffle=False)
+        batch = next(iter(loader))
+        fundus = batch["fundus"]  # [B, T, 3, H, W]
+        assert fundus.shape == (2, 4, 3, 32, 32)
+        feats = encode_visits(encoder, fundus, device=torch.device("cpu"))
+        assert feats.shape == (2, 4, 8)
 
 
 class TestTrainScreeningClassifierInProcess:
