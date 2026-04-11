@@ -50,6 +50,12 @@ class SpecialistOutput:
     # VF analysis
     vf_classification: torch.Tensor | None = None
     vf_node_importance: torch.Tensor | None = None
+    # Graph readout embedding from VFGraphNet.encode_graph(), shape
+    # [B, readout_dim]. This is the feature that downstream fusion and
+    # forecasting modules consume — the two-class ``vf_classification``
+    # logits are a clinical readout only, not a feature vector, and must
+    # NOT be re-used as a [B, vf_dim] input to the fusion/forecaster heads.
+    vf_embedding: torch.Tensor | None = None
 
     # Progression forecasting (core Tier 2 value)
     progression_probability: float | None = None
@@ -202,10 +208,22 @@ class SpecialistPipeline:
         # --- VF graph analysis ---
 
         if vf_data is not None and self.vf_graph_net is not None:
-            output.vf_classification = self.vf_graph_net(vf_data.to(self.device))
-            output.vf_node_importance = self.vf_graph_net.get_node_importance(
-                vf_data.to(self.device)
-            )
+            vf_on_device = vf_data.to(self.device)
+            # Produce BOTH outputs:
+            #   - vf_classification: [B, num_classes] logits for the clinical
+            #     readout (normal vs glaucomatous VF).
+            #   - vf_embedding: [B, readout_dim] graph-level embedding, the
+            #     feature that fusion + forecaster heads were *configured*
+            #     to consume. ``specialist.yaml`` declares ``vf: 256`` and
+            #     ``vf_dim: 256`` — these expect the readout, not the
+            #     classification head.
+            output.vf_classification = self.vf_graph_net(vf_on_device)
+            if hasattr(self.vf_graph_net, "encode_graph"):
+                output.vf_embedding = self.vf_graph_net.encode_graph(vf_on_device)
+            if hasattr(self.vf_graph_net, "get_node_importance"):
+                output.vf_node_importance = self.vf_graph_net.get_node_importance(
+                    vf_on_device
+                )
 
         # --- Multimodal fusion (current visit) ---
 
@@ -215,8 +233,13 @@ class SpecialistPipeline:
                 modality_feats["fundus"] = output.dinov2_fundus_embedding
             if output.dinov2_oct_embedding is not None:
                 modality_feats["oct"] = output.dinov2_oct_embedding
-            if output.vf_classification is not None:
-                # Use the logits as a compact VF feature
+            if output.vf_embedding is not None:
+                # Feed the graph-level readout embedding so the shape
+                # matches the fusion module's ``vf`` modality_dim.
+                modality_feats["vf"] = output.vf_embedding
+            elif output.vf_classification is not None:
+                # Back-compat path for stub VFGraphNets without encode_graph
+                # (used by some unit tests).
                 modality_feats["vf"] = output.vf_classification
             if clinical_data is not None:
                 clin_vec = torch.tensor(
@@ -267,18 +290,21 @@ class SpecialistPipeline:
                         device=self.device,
                     ).unsqueeze(0)
 
+                # Prefer the graph readout embedding for the forecaster's
+                # ``vf_features`` slot. The classification logits are NOT a
+                # feature vector and break any forecaster configured with
+                # ``vf_dim > num_classes``.
                 vf_features = None
-                if output.vf_classification is not None:
+                if output.vf_embedding is not None:
+                    vf_features = output.vf_embedding
+                elif output.vf_classification is not None:
                     vf_features = output.vf_classification
 
-                try:
-                    forecast = self.forecaster(
-                        temporal_embedding,
-                        clinical_features=clinical_features,
-                        vf_features=vf_features,
-                    )
-                except TypeError:
-                    forecast = self.forecaster(temporal_embedding)
+                forecast = self._forecast_with_fallback(
+                    temporal_embedding=temporal_embedding,
+                    clinical_features=clinical_features,
+                    vf_features=vf_features,
+                )
 
                 self._populate_forecast(output, forecast)
 
@@ -311,6 +337,44 @@ class SpecialistPipeline:
     # ------------------------------------------------------------------
     # Progression forecasting helpers
     # ------------------------------------------------------------------
+
+    def _forecast_with_fallback(
+        self,
+        temporal_embedding: torch.Tensor,
+        clinical_features: torch.Tensor | None,
+        vf_features: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        """Run the forecaster, falling back gracefully when upstream
+        modalities are malformed.
+
+        The strict call path passes whichever ancillary features the
+        pipeline managed to produce. If that raises because a feature has
+        the wrong shape (typically: a legacy stub VFGraphNet returned
+        classification logits instead of the graph readout), we retry
+        with the bad modality dropped so the forecaster zero-pads
+        internally. A final positional fallback handles forecasters
+        whose ``forward`` does not accept kwargs at all.
+        """
+        try:
+            return self.forecaster(
+                temporal_embedding,
+                clinical_features=clinical_features,
+                vf_features=vf_features,
+            )
+        except ValueError:
+            # Shape-mismatch path. Drop the vf channel and let the
+            # forecaster zero-pad any configured-but-missing modality.
+            try:
+                return self.forecaster(
+                    temporal_embedding,
+                    clinical_features=clinical_features,
+                    vf_features=None,
+                )
+            except TypeError:
+                return self.forecaster(temporal_embedding)
+        except TypeError:
+            # Forecaster signature does not accept kwargs — positional only.
+            return self.forecaster(temporal_embedding)
 
     def _stack_visit_features(
         self, visit_history: list[dict]

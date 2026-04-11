@@ -154,6 +154,15 @@ class EvidentialForecaster(nn.Module):
         """
         super().__init__()
 
+        # Persist the per-modality dims so ``forward`` can zero-pad any
+        # modality that is missing at inference time. A patient may have
+        # no VF test on a given visit, or a rural referral may arrive
+        # without clinical metadata — the forecaster should degrade to
+        # temporal-only instead of crashing with a shape mismatch.
+        self.temporal_dim = temporal_dim
+        self.clinical_dim = clinical_dim
+        self.vf_dim = vf_dim
+
         total_input = temporal_dim + clinical_dim + vf_dim
 
         # Shared feature extraction
@@ -174,6 +183,37 @@ class EvidentialForecaster(nn.Module):
         # Regression head (future RNFL thickness)
         self.regression_head = EvidentialRegressionHead(hidden_dim)
 
+    def _pad_modality(
+        self,
+        feature: torch.Tensor | None,
+        expected_dim: int,
+        batch_size: int,
+        reference: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return ``feature`` unchanged, or a zero tensor of the right
+        shape when the modality is missing but was configured at init.
+
+        Returns ``None`` when the modality was not configured (expected_dim=0).
+        Raises ``ValueError`` if a feature is provided but has the wrong
+        trailing dim — that points at an upstream wiring bug, not a
+        missing-modality case, and should be loud.
+        """
+        if expected_dim == 0:
+            return None
+        if feature is None:
+            return torch.zeros(
+                batch_size, expected_dim,
+                device=reference.device, dtype=reference.dtype,
+            )
+        if feature.shape[-1] != expected_dim:
+            raise ValueError(
+                f"EvidentialForecaster: expected feature with trailing dim "
+                f"{expected_dim}, got {tuple(feature.shape)}. This usually "
+                f"means the pipeline is forwarding classification logits "
+                f"where a [B, vf_dim] graph embedding is expected."
+            )
+        return feature
+
     def forward(
         self,
         temporal_features: torch.Tensor,
@@ -185,18 +225,29 @@ class EvidentialForecaster(nn.Module):
         Args:
             temporal_features: [B, temporal_dim] from DeltaTMamba.
             clinical_features: [B, clinical_dim] optional clinical data.
+                Missing clinical data is zero-padded when clinical_dim > 0.
             vf_features: [B, vf_dim] optional VF graph embeddings.
+                Missing VF data is zero-padded when vf_dim > 0.
 
         Returns:
             Dict with:
               - 'classification': evidential classification output
               - 'regression': evidential regression output (RNFL prediction)
         """
-        parts = [temporal_features]
-        if clinical_features is not None:
-            parts.append(clinical_features)
-        if vf_features is not None:
-            parts.append(vf_features)
+        batch_size = temporal_features.shape[0]
+        parts: list[torch.Tensor] = [temporal_features]
+
+        padded_clinical = self._pad_modality(
+            clinical_features, self.clinical_dim, batch_size, temporal_features,
+        )
+        if padded_clinical is not None:
+            parts.append(padded_clinical)
+
+        padded_vf = self._pad_modality(
+            vf_features, self.vf_dim, batch_size, temporal_features,
+        )
+        if padded_vf is not None:
+            parts.append(padded_vf)
 
         x = torch.cat(parts, dim=-1)
         h = self.shared(x)

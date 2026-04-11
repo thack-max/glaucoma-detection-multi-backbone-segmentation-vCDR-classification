@@ -212,3 +212,132 @@ class TestSpecialistPipeline:
             timestamps=torch.tensor([[0.0]]),
         )
         assert output.progression_probability is None
+
+    def test_vf_embedding_is_populated_from_encode_graph(self):
+        """Regression: the pipeline must expose the graph-level readout
+        embedding (``[B, readout_dim]``) as ``vf_embedding`` in addition to
+        the classification logits. Downstream fusion + forecaster configs
+        declare ``vf`` / ``vf_dim`` as the readout, not the logits."""
+        from src.models.progression.vf_graph_net import VFGraphNet
+
+        vf_net = VFGraphNet(
+            node_features=3, hidden_dim=32, num_gin_layers=2, output_dim=32,
+        )
+        vf_net.eval()
+        pipeline = SpecialistPipeline(vf_graph_net=vf_net, device="cpu")
+
+        vf = torch.randn(1, 54, 3)
+        with torch.no_grad():
+            out = pipeline.run(vf_data=vf)
+
+        # Classification logits (clinical readout)
+        assert out.vf_classification is not None
+        assert out.vf_classification.shape == (1, 2)
+        # Graph readout embedding (feature for fusion + forecaster) —
+        # readout_dim = output_dim * 2 = 64
+        assert out.vf_embedding is not None
+        assert out.vf_embedding.shape == (1, 64)
+
+    def test_forecaster_receives_vf_embedding_not_logits(self):
+        """Regression for shape-mismatch crash: with a realistic specialist
+        config (``vf_dim == VFGraphNet.readout_dim``) the forecaster must
+        accept the VF embedding from the pipeline without blowing up."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+        from src.models.progression.evidential_forecaster import (
+            EvidentialForecaster,
+        )
+        from src.models.progression.vf_graph_net import VFGraphNet
+
+        vf_net = VFGraphNet(
+            node_features=3, hidden_dim=32, num_gin_layers=2, output_dim=32,
+        )
+        temporal = DeltaTMamba(
+            input_dim=32, d_model=16, d_state=4, num_layers=1, expand=1,
+        )
+        # vf_dim here matches the graph readout (32 * 2 = 64), NOT num_classes.
+        # Under the legacy pipeline wiring the forecaster would be fed the
+        # [B, 2] classification logits and the first Linear(80, hidden) in
+        # `shared` would raise RuntimeError.
+        forecaster = EvidentialForecaster(
+            temporal_dim=16,
+            clinical_dim=3,
+            vf_dim=64,
+            hidden_dim=16,
+            num_classes=2,
+        )
+        for m in (vf_net, temporal, forecaster):
+            m.eval()
+
+        pipeline = SpecialistPipeline(
+            vf_graph_net=vf_net,
+            temporal_encoder=temporal,
+            forecaster=forecaster,
+            device="cpu",
+        )
+
+        vf = torch.randn(1, 54, 3)
+        visit_history = [{"features": torch.randn(32)} for _ in range(3)]
+        timestamps = torch.tensor([[0.0, 90.0, 180.0]])
+        clinical = {"iop": 18.0, "age": 67.0, "sex": 1.0}
+
+        with torch.no_grad():
+            out = pipeline.run(
+                vf_data=vf,
+                visit_history=visit_history,
+                timestamps=timestamps,
+                clinical_data=clinical,
+            )
+
+        assert out.progression_probability is not None
+        assert 0.0 <= out.progression_probability <= 1.0
+        # The embedding path should have been exercised (not the fallback).
+        assert out.vf_embedding is not None
+        assert out.vf_embedding.shape == (1, 64)
+
+    def test_forecaster_falls_back_on_vf_shape_mismatch(self):
+        """If a stub VFGraphNet produces an unexpected embedding shape
+        (e.g. legacy configs still passing classification logits), the
+        pipeline should fall back to temporal-only forecasting instead of
+        aborting. Previously the try/except only caught TypeError."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+        from src.models.progression.evidential_forecaster import (
+            EvidentialForecaster,
+        )
+
+        class _BadVFNet(torch.nn.Module):
+            """Stub that ONLY returns classification logits — no
+            ``encode_graph``. The pipeline used to crash the forecaster
+            by forwarding these [B, 2] logits into a vf_dim=64 head."""
+
+            def forward(self, x):
+                return torch.zeros(x.shape[0], 2)
+
+        temporal = DeltaTMamba(
+            input_dim=32, d_model=16, d_state=4, num_layers=1, expand=1,
+        )
+        forecaster = EvidentialForecaster(
+            temporal_dim=16,
+            clinical_dim=0,
+            vf_dim=64,
+            hidden_dim=16,
+            num_classes=2,
+        )
+        for m in (temporal, forecaster):
+            m.eval()
+
+        pipeline = SpecialistPipeline(
+            vf_graph_net=_BadVFNet(),
+            temporal_encoder=temporal,
+            forecaster=forecaster,
+            device="cpu",
+        )
+
+        with torch.no_grad():
+            out = pipeline.run(
+                vf_data=torch.randn(1, 54, 3),
+                visit_history=[{"features": torch.randn(32)} for _ in range(3)],
+                timestamps=torch.tensor([[0.0, 90.0, 180.0]]),
+            )
+
+        # Fallback path: forecast still produced, just without vf_features.
+        assert out.progression_probability is not None
