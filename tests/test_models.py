@@ -148,6 +148,108 @@ class TestDeltaTMamba:
             out = model.forward_sequence(x)
         assert out.shape == (1, 4, 32)  # [B, T, d_model*2]
 
+    def test_compute_delta_t_first_position_is_zero(self):
+        """By convention the first visit has no prior, so delta_t[:, 0] == 0.
+        Independent of whether timestamps are ascending or descending."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+
+        ts = torch.tensor([[0.0, 30.0, 90.0, 180.0]])
+        dt_fwd = DeltaTMamba._compute_delta_t(ts)
+        assert dt_fwd.shape == (1, 4, 1)
+        assert dt_fwd[0, 0, 0].item() == 0.0
+        # Normalised by the max gap (90 days here): [0, 30/90, 60/90, 90/90].
+        assert torch.allclose(
+            dt_fwd.squeeze(-1),
+            torch.tensor([[0.0, 1 / 3, 2 / 3, 1.0]]),
+            atol=1e-6,
+        )
+
+        # Reversed timestamps: the first position must still be 0.
+        dt_bwd = DeltaTMamba._compute_delta_t(ts.flip(1))
+        assert dt_bwd[0, 0, 0].item() == 0.0
+        # Naively flipping dt_fwd would put dt_fwd[:, -1] at position 0 and
+        # is NOT equivalent to recomputing from the reversed timestamps.
+        assert not torch.equal(dt_bwd, dt_fwd.flip(1))
+
+    def test_forward_pools_most_informed_positions(self):
+        """Regression: ``forward`` must pool from ``h_fwd[:, -1]`` +
+        ``h_bwd[:, 0]`` (the most informed state in each direction) rather
+        than ``h_bidir[:, -1]`` which mixes the fully-informed forward state
+        with the *least* informed backward state."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+
+        torch.manual_seed(0)
+        model = DeltaTMamba(
+            input_dim=8, d_model=4, d_state=2, num_layers=1, expand=1,
+        )
+        model.eval()
+
+        x = torch.randn(1, 4, 8)  # T=4 so position 0 != position -1
+        with torch.no_grad():
+            pooled = model(x)
+            seq = model.forward_sequence(x)
+            d = seq.shape[-1] // 2
+            expected_raw = torch.cat([seq[:, -1, :d], seq[:, 0, d:]], dim=-1)
+            expected = model.output_proj(expected_raw)
+
+        assert torch.allclose(pooled, expected, atol=1e-6)
+
+        # And explicitly: must NOT match the legacy buggy pooling path.
+        with torch.no_grad():
+            buggy = model.output_proj(seq[:, -1])
+        assert not torch.allclose(pooled, buggy, atol=1e-5), (
+            "forward() is still pooling from h_bidir[:, -1] (legacy bug)"
+        )
+
+    def test_backward_pass_depends_on_middle_visit(self):
+        """The backward contribution at position 0 is the SSM state after
+        traversing every visit in reverse. Perturbing a middle visit must
+        therefore change it. Under the legacy bug (using h_bwd[:, -1] as the
+        backward contribution) the backward state saw only the final visit,
+        so middle-visit perturbations were silently ignored."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+
+        torch.manual_seed(1)
+        model = DeltaTMamba(
+            input_dim=8, d_model=4, d_state=2, num_layers=1, expand=1,
+        )
+        model.eval()
+
+        x = torch.randn(1, 5, 8)
+        with torch.no_grad():
+            seq_before = model.forward_sequence(x)
+
+        x_perturbed = x.clone()
+        x_perturbed[:, 2] = torch.randn(8)  # Middle visit
+        with torch.no_grad():
+            seq_after = model.forward_sequence(x_perturbed)
+
+        d = seq_before.shape[-1] // 2
+        h_bwd_first_before = seq_before[:, 0, d:]
+        h_bwd_first_after = seq_after[:, 0, d:]
+
+        assert not torch.allclose(
+            h_bwd_first_before, h_bwd_first_after, atol=1e-6
+        ), "Backward pass at position 0 must depend on middle visits"
+
+    def test_forward_changes_when_timestamps_change(self):
+        """Sanity check that the time-aware SSM is actually using delta_t."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+
+        torch.manual_seed(2)
+        model = DeltaTMamba(
+            input_dim=8, d_model=4, d_state=2, num_layers=1, expand=1,
+        )
+        model.eval()
+
+        x = torch.randn(1, 4, 8)
+        ts_regular = torch.tensor([[0.0, 30.0, 60.0, 90.0]])
+        ts_irregular = torch.tensor([[0.0, 30.0, 45.0, 500.0]])
+        with torch.no_grad():
+            out_reg = model(x, ts_regular)
+            out_irreg = model(x, ts_irregular)
+        assert not torch.allclose(out_reg, out_irreg, atol=1e-6)
+
 
 # --- VF Graph Net ---
 

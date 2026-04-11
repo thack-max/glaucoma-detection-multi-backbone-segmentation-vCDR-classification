@@ -238,6 +238,29 @@ class DeltaTMamba(nn.Module):
             nn.GELU(),
         )
 
+    @staticmethod
+    def _compute_delta_t(timestamps: torch.Tensor) -> torch.Tensor:
+        """Compute per-visit delta_t normalized to [0, 1] for an SSM pass.
+
+        Defines the "time since the previous visit" signal consumed by the
+        selective scan. By convention the first position has no prior visit,
+        so ``delta_t[:, 0] = 0``.
+
+        Args:
+            timestamps: [B, T] visit timestamps in consistent units
+                (days/months). Ordering does not have to be ascending — we
+                take ``abs`` so reverse-ordered timestamps (used for the
+                backward pass) produce the same positive gaps.
+
+        Returns:
+            delta_t: [B, T, 1] with ``delta_t[:, 0] == 0`` and values
+            normalized by the per-sequence max gap.
+        """
+        dt = torch.zeros_like(timestamps)
+        dt[:, 1:] = (timestamps[:, 1:] - timestamps[:, :-1]).abs()
+        dt_max = dt.max(dim=1, keepdim=True).values.clamp(min=1.0)
+        return (dt / dt_max).unsqueeze(-1)
+
     def forward(
         self,
         visit_features: torch.Tensor,
@@ -254,42 +277,21 @@ class DeltaTMamba(nn.Module):
         Returns:
             Sequence representation [B, d_model] — pooled temporal embedding.
         """
-        B, T, _ = visit_features.shape
+        h_bidir = self.forward_sequence(visit_features, timestamps)
+        d_model = h_bidir.shape[-1] // 2
 
-        # Compute inter-visit time deltas
-        delta_t = None
-        if timestamps is not None:
-            # Compute differences: delta_t[t] = timestamps[t] - timestamps[t-1]
-            dt = torch.zeros_like(timestamps)
-            dt[:, 1:] = timestamps[:, 1:] - timestamps[:, :-1]
-            dt[:, 0] = 0.0  # First visit has no prior
-            # Normalize to [0, 1] range per sequence
-            dt_max = dt.max(dim=1, keepdim=True).values.clamp(min=1.0)
-            delta_t = (dt / dt_max).unsqueeze(-1)  # [B, T, 1]
-
-        # Project inputs
-        x = self.input_proj(visit_features)
-
-        # Forward pass
-        h_fwd = x
-        for layer in self.layers:
-            h_fwd = layer(h_fwd, delta_t)
-
-        # Backward pass (reverse sequence)
-        x_rev = x.flip(1)
-        delta_t_rev = delta_t.flip(1) if delta_t is not None else None
-        h_bwd = x_rev
-        for layer in self.reverse_layers:
-            h_bwd = layer(h_bwd, delta_t_rev)
-        h_bwd = h_bwd.flip(1)  # Flip back
-
-        # Concatenate bidirectional outputs
-        h_bidir = torch.cat([h_fwd, h_bwd], dim=-1)  # [B, T, d_model*2]
-
-        # Pool: use last forward + first backward (most informed positions)
-        pooled = self.output_proj(h_bidir[:, -1])
-
-        return pooled
+        # Pool from the MOST INFORMED position in each direction:
+        #   - Forward: the last index has consumed every prior visit.
+        #   - Backward: after the final flip-back, the FIRST index is the
+        #     backward SSM state *after* traversing every visit in reverse.
+        # Concatenating h_bidir[:, -1] (the legacy behaviour) mixed the fully
+        # informed forward state with the LEAST informed backward state
+        # (which had only processed the last visit), effectively throwing
+        # away the backward pass for progression forecasting.
+        h_fwd_last = h_bidir[:, -1, :d_model]
+        h_bwd_first = h_bidir[:, 0, d_model:]
+        pooled_raw = torch.cat([h_fwd_last, h_bwd_first], dim=-1)
+        return self.output_proj(pooled_raw)
 
     def forward_sequence(
         self,
@@ -307,25 +309,30 @@ class DeltaTMamba(nn.Module):
         Returns:
             Temporal embeddings [B, T, d_model*2].
         """
-        B, T, _ = visit_features.shape
-        delta_t = None
+        # Forward delta_t directly from the original timestamps.
+        delta_t_fwd = None
+        delta_t_bwd = None
         if timestamps is not None:
-            dt = torch.zeros_like(timestamps)
-            dt[:, 1:] = timestamps[:, 1:] - timestamps[:, :-1]
-            dt_max = dt.max(dim=1, keepdim=True).values.clamp(min=1.0)
-            delta_t = (dt / dt_max).unsqueeze(-1)
+            delta_t_fwd = self._compute_delta_t(timestamps)
+            # Backward delta_t: compute from the REVERSED timestamps so the
+            # first position of the reversed sequence has delta_t = 0.
+            # Flipping ``delta_t_fwd`` would incorrectly place
+            # ``delta_t_fwd[T-1]`` at position 0 and drop the gap between
+            # visit 0 and visit 1 entirely.
+            delta_t_bwd = self._compute_delta_t(timestamps.flip(1))
 
         x = self.input_proj(visit_features)
 
+        # Forward pass over the original sequence order.
         h_fwd = x
         for layer in self.layers:
-            h_fwd = layer(h_fwd, delta_t)
+            h_fwd = layer(h_fwd, delta_t_fwd)
 
+        # Backward pass over the reversed sequence.
         x_rev = x.flip(1)
-        delta_t_rev = delta_t.flip(1) if delta_t is not None else None
         h_bwd = x_rev
         for layer in self.reverse_layers:
-            h_bwd = layer(h_bwd, delta_t_rev)
-        h_bwd = h_bwd.flip(1)
+            h_bwd = layer(h_bwd, delta_t_bwd)
+        h_bwd = h_bwd.flip(1)  # Realign with original visit order.
 
         return torch.cat([h_fwd, h_bwd], dim=-1)
