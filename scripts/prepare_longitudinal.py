@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path

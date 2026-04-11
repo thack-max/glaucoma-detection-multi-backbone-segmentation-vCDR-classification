@@ -31,7 +31,6 @@ import json
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.data.multimodal_dataset import MultimodalGlaucomaDataset
@@ -128,8 +127,9 @@ def _forward_batch(
 
     if "vf" in batch:
         vf_input = batch["vf"][:, -1].to(device)  # [B, 54, 3] latest visit
-        vf_logits = vf_net(vf_input)
-        # Use the VF graph embedding as the feature (forecaster learns to project)
+        # encode_graph produces the readout we hand off to the fusion module;
+        # we intentionally do NOT call vf_net(vf_input) separately, since
+        # that would run the classifier head over the same features.
         modality_feats["vf"] = vf_net.encode_graph(vf_input)
 
     modality_feats["clinical"] = clinical_seq[:, -1]  # latest visit clinical [B, 3]

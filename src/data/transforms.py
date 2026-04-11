@@ -14,7 +14,6 @@ making edge detection more amenable to CNN/transformer kernels.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 import torch
@@ -130,6 +129,14 @@ class FundusTransform:
     Designed to be dependency-light (numpy only) so that tests and the
     screening pipeline remain importable without torchvision. If torchvision
     is available it could be substituted by the caller.
+
+    Polar preprocessing:
+        Setting ``polar=True`` warps the resized image (and any masks) into
+        polar coordinates about the image centre. This is the preprocessing
+        trick used by the PMC12469222 baseline to simplify OD/OC contour
+        segmentation — the radially symmetric optic nerve head becomes a
+        rectangular strip, and disc/cup boundaries become near-horizontal.
+        BoundaryFormer training can opt into this as a cheap augmentation.
     """
 
     image_size: int = 224
@@ -137,6 +144,9 @@ class FundusTransform:
     # ImageNet-style normalization (matches DINOv2 pre-training).
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+    # Polar preprocessing (opt-in)
+    polar: bool = False
+    polar_radius_frac: float = 0.5  # radius relative to image_size / 2
 
     def _resize(self, arr: np.ndarray) -> np.ndarray:
         if cv2 is not None:
@@ -184,6 +194,17 @@ class FundusTransform:
             if cup_mask is not None:
                 cup_mask = self._resize(cup_mask)
 
+        # Polar preprocessing (applied AFTER resize so the radius is consistent)
+        if self.polar:
+            center = (self.image_size // 2, self.image_size // 2)
+            radius = self.polar_radius_frac * self.image_size
+            out_size = (self.image_size, self.image_size)
+            img = cartesian_to_polar(img, center, radius, out_size)
+            if disc_mask is not None:
+                disc_mask = cartesian_to_polar(disc_mask, center, radius, out_size)
+            if cup_mask is not None:
+                cup_mask = cartesian_to_polar(cup_mask, center, radius, out_size)
+
         # To tensor + normalize
         img_t = torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
         mean = torch.tensor(self.mean).view(3, 1, 1)
@@ -200,11 +221,21 @@ class FundusTransform:
         return out
 
 
-def get_fundus_transforms(split: str = "train", image_size: int = 224) -> FundusTransform:
+def get_fundus_transforms(
+    split: str = "train",
+    image_size: int = 224,
+    polar: bool = False,
+) -> FundusTransform:
     """Convenience constructor used by training/evaluation scripts.
 
     Args:
         split: "train", "val", or "test". Only "train" enables augmentation.
         image_size: Output square size in pixels.
+        polar: If True, wrap the image into polar coordinates. Matches the
+            PMC12469222 baseline's OD/OC preprocessing.
     """
-    return FundusTransform(image_size=image_size, train=(split == "train"))
+    return FundusTransform(
+        image_size=image_size,
+        train=(split == "train"),
+        polar=polar,
+    )

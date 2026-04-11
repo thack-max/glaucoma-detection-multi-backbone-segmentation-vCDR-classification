@@ -24,7 +24,6 @@ original fundus image via overlay_heatmap_on_image.
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import numpy as np
 import torch

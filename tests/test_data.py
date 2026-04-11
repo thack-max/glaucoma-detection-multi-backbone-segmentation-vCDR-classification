@@ -55,6 +55,36 @@ def test_train_mode_augmentation_runs():
         assert out["image"].shape == (3, 16, 16)
 
 
+def test_polar_transform_preserves_shape():
+    """Opt-in polar preprocessing: same output shape, different content."""
+    image = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+    cartesian = get_fundus_transforms("val", image_size=32, polar=False)(image)
+    polar = get_fundus_transforms("val", image_size=32, polar=True)(image)
+    assert cartesian["image"].shape == polar["image"].shape == (3, 32, 32)
+    # The polar view should differ from the cartesian one
+    assert not torch.allclose(cartesian["image"], polar["image"])
+
+
+def test_polar_transform_with_masks():
+    """Polar preprocessing warps masks alongside the image."""
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    # Concentric disc pattern
+    y, x = np.ogrid[:64, :64]
+    disc = ((y - 32) ** 2 + (x - 32) ** 2) < 20 ** 2
+    cup = ((y - 32) ** 2 + (x - 32) ** 2) < 10 ** 2
+    image[disc] = 150
+    disc_mask = disc.astype(np.uint8)
+    cup_mask = cup.astype(np.uint8)
+
+    out = get_fundus_transforms("val", image_size=32, polar=True)(
+        image, disc_mask=disc_mask, cup_mask=cup_mask,
+    )
+    assert out["disc_mask"].shape == (32, 32)
+    assert out["cup_mask"].shape == (32, 32)
+    # Cup mask in polar space should still be strictly smaller than disc mask
+    assert out["cup_mask"].sum() < out["disc_mask"].sum()
+
+
 # ---------------------------------------------------------------------------
 # FundusDataset
 # ---------------------------------------------------------------------------

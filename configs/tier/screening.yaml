@@ -18,6 +18,10 @@ segmentation:
   growth_rate: 32
   checkpoint: null  # Path to trained BoundaryFormer weights
   image_size: 512
+  # Optional polar preprocessing (PMC12469222-style). Set true to train
+  # BoundaryFormer on polar-warped fundus photos — disc/cup boundaries
+  # become near-horizontal strips that are easier to delineate.
+  polar: false
 
 feature_extraction:
   model: dinov2_vitb14

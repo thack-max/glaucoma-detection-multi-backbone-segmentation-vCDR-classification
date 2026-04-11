@@ -52,5 +52,16 @@ include = ["src*"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.lint]
+# F401 is fine in __init__.py files (they re-export public symbols).
+# F841 covers locals that are assigned but unused — permit these in tests
+# where the binding documents intent.
+extend-select = ["E", "F", "W"]
+ignore = ["E501"]  # line length handled by the formatter
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*" = ["F401"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

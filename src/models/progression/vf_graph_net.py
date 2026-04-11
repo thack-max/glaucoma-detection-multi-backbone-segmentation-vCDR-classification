@@ -34,7 +34,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # 24-2 Humphrey VF test point coordinates (approximate grid positions)
