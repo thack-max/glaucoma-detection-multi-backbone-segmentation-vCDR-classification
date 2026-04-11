@@ -92,6 +92,21 @@ class TestDINOv2Encoder:
         assert "dinov2_vitb14" in DINOv2Encoder.VARIANTS
         assert DINOv2Encoder.VARIANTS["dinov2_vitb14"]["embed_dim"] == 768
 
+    def test_forward_handles_arbitrary_input_sizes(self):
+        """DINOv2's timm-backed VIT strictly checks input size; the encoder
+        must transparently resize to what the model was built for so that
+        downstream pipelines can pass 64x64 test images, 224x224 inference
+        crops, or the full 518x518 paper-default."""
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        encoder = DINOv2Encoder(variant="dinov2_vitb14", freeze_encoder=True)
+        encoder.eval()
+        for size in (32, 64, 224):
+            x = torch.randn(1, 3, size, size)
+            with torch.no_grad():
+                out = encoder(x)
+            assert out.shape == (1, encoder.embed_dim)
+
 
 # --- Delta-t Mamba ---
 

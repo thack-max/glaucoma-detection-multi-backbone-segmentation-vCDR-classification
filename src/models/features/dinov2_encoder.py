@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DINOv2Encoder(nn.Module):
@@ -81,6 +82,21 @@ class DINOv2Encoder(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
+        # Detect the input size the underlying timm/ViT expects. DINOv2 is
+        # commonly wrapped in a timm VisionTransformer whose patch_embed
+        # strictly asserts the input spatial size; callers may pass arbitrary
+        # sizes (64x64 unit tests, 224x224 inference, 518x518 paper default),
+        # so we resize on the fly in forward() to whatever the encoder was
+        # built for.
+        self._expected_hw: tuple[int, int] | None = None
+        patch_embed = getattr(self.encoder, "patch_embed", None)
+        if patch_embed is not None and hasattr(patch_embed, "img_size"):
+            ps = patch_embed.img_size
+            if isinstance(ps, (tuple, list)) and len(ps) == 2:
+                self._expected_hw = (int(ps[0]), int(ps[1]))
+            elif isinstance(ps, int):
+                self._expected_hw = (ps, ps)
+
     def _build_fallback(self, variant: str) -> nn.Module:
         """Build DINOv2 architecture without pretrained weights.
 
@@ -103,16 +119,34 @@ class DINOv2Encoder(nn.Module):
                 nn.Linear(3, self.embed_dim),
             )
 
+    def _match_input_size(self, x: torch.Tensor) -> torch.Tensor:
+        """Resize inputs to the encoder's expected spatial size.
+
+        The torch.hub DINOv2 weights are wrapped in a timm VisionTransformer
+        whose patch_embed asserts the input size, so we can't rely on
+        "dynamic_img_size" handling being enabled. Resizing to the expected
+        H/W up-front is the portable fix and matches DINOv2's standard
+        inference convention (224 or 518 square).
+        """
+        if self._expected_hw is None:
+            return x
+        eh, ew = self._expected_hw
+        if x.shape[-2:] != (eh, ew):
+            x = F.interpolate(x, size=(eh, ew), mode="bilinear", align_corners=False)
+        return x
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract CLS token embedding.
 
         Args:
-            x: Image tensor [B, 3, H, W]. DINOv2 expects 224x224 or 518x518,
-               but handles arbitrary sizes via patch interpolation.
+            x: Image tensor [B, 3, H, W]. Will be resized to the encoder's
+               expected size before running the forward pass (DINOv2 was
+               pretrained at 224/518 square).
 
         Returns:
             Feature embedding [B, embed_dim].
         """
+        x = self._match_input_size(x)
         if hasattr(self.encoder, "forward_features"):
             # timm-style interface
             features = self.encoder.forward_features(x)
@@ -140,6 +174,7 @@ class DINOv2Encoder(nn.Module):
         Returns:
             Patch tokens [B, num_patches, embed_dim] (excluding CLS token).
         """
+        x = self._match_input_size(x)
         if hasattr(self.encoder, "forward_features"):
             features = self.encoder.forward_features(x)
             if isinstance(features, dict):
@@ -168,6 +203,7 @@ class DINOv2Encoder(nn.Module):
         Returns:
             Attention maps [B, num_heads, num_patches, num_patches].
         """
+        x = self._match_input_size(x)
         if hasattr(self.encoder, "get_last_selfattention"):
             return self.encoder.get_last_selfattention(x)
 
