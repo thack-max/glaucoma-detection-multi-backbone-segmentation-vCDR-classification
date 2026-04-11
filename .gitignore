@@ -13,9 +13,10 @@ build/
 venv/
 env/
 
-# Data (do not commit datasets)
-data/
-datasets/
+# Data (do not commit datasets) — anchored to repo root so that the
+# `src/data/` Python module is not excluded.
+/data/
+/datasets/
 *.h5
 *.hdf5
 *.npy

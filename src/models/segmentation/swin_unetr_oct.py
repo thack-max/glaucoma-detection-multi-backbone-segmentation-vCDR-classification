@@ -238,10 +238,14 @@ class SwinUNETROCT(nn.Module):
         B = x.shape[0]
         spatial = x.shape[2:]
 
-        # Patch embed
+        # Patch embed — also yields the exact post-patching grid size so we
+        # do NOT have to guess it from the token count later.
         tokens, grid_size = self.patch_embed(x)
+        grid_D, grid_H, grid_W = grid_size
 
-        # Encoder with skip connections
+        # Encoder with skip connections. The channel-only downsample in
+        # SwinStage3D preserves the token count, so every skip has the same
+        # spatial grid as the patch embedding — we can reshape deterministically.
         skips = []
         h = tokens
         for stage in self.stages:
@@ -251,20 +255,10 @@ class SwinUNETROCT(nn.Module):
         # Bottleneck
         h = self.bottleneck(h)
 
-        # Reshape for 3D decoder — estimate spatial dims from token count
-        # The last stage's skip has the same spatial size as bottleneck
         def tokens_to_volume(t: torch.Tensor, dim: int) -> torch.Tensor:
-            """Reshape flat tokens to 3D feature volume."""
-            n = t.shape[1]
-            # Estimate spatial dimensions (approximate cube root)
-            d = max(1, round(n ** (1/3)))
-            hw = max(1, round((n / d) ** 0.5))
-            w = max(1, n // (d * hw))
-            # Adjust to match exactly
-            while d * hw * w < n:
-                w += 1
-            t = t[:, :d*hw*w]  # trim if needed
-            return t.transpose(1, 2).reshape(B, dim, d, hw, w)
+            """Reshape [B, N, C] tokens back to [B, C, D, H, W] using the
+            known grid size from PatchEmbed3D."""
+            return t.transpose(1, 2).reshape(B, dim, grid_D, grid_H, grid_W)
 
         # Convert skip connections and bottleneck to volumes
         dims = [s.shape[-1] for s in skips]

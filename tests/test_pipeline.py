@@ -165,3 +165,50 @@ class TestSpecialistPipeline:
         assert intake["has_fundus_segmentation"] is True
         assert intake["needs_oct"] is True
         assert intake["needs_longitudinal"] is True
+
+    def test_progression_forecasting_end_to_end(self):
+        """Full Delta-t Mamba -> Evidential forecaster integration."""
+        from src.models.progression.delta_t_mamba import DeltaTMamba
+        from src.models.progression.evidential_forecaster import EvidentialForecaster
+
+        temporal = DeltaTMamba(
+            input_dim=32, d_model=16, d_state=4, num_layers=1, expand=1,
+        )
+        forecaster = EvidentialForecaster(
+            temporal_dim=16, clinical_dim=3, hidden_dim=16, num_classes=2,
+        )
+        pipeline = SpecialistPipeline(
+            temporal_encoder=temporal,
+            forecaster=forecaster,
+            device="cpu",
+        )
+        pipeline.temporal_encoder.eval()
+        pipeline.forecaster.eval()
+
+        visit_history = [
+            {"features": torch.randn(32)} for _ in range(4)
+        ]
+        timestamps = torch.tensor([[0, 90, 180, 365]], dtype=torch.float32)
+        clinical = {"iop": 18.0, "age": 67.0, "sex": 1.0}
+
+        with torch.no_grad():
+            output = pipeline.run(
+                visit_history=visit_history,
+                timestamps=timestamps,
+                clinical_data=clinical,
+            )
+
+        assert output.progression_probability is not None
+        assert 0.0 <= output.progression_probability <= 1.0
+        assert output.progression_class in {"stable", "slow", "rapid"}
+        assert output.progression_uncertainty is not None
+        assert output.predicted_rnfl_thickness is not None
+
+    def test_progression_without_forecaster(self):
+        """Missing forecaster should not crash the pipeline."""
+        pipeline = SpecialistPipeline(device="cpu")
+        output = pipeline.run(
+            visit_history=[{"features": torch.randn(32)}],
+            timestamps=torch.tensor([[0.0]]),
+        )
+        assert output.progression_probability is None
