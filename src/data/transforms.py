@@ -147,6 +147,14 @@ class FundusTransform:
     # Polar preprocessing (opt-in)
     polar: bool = False
     polar_radius_frac: float = 0.5  # radius relative to image_size / 2
+    # Augmentation strengths (only applied when train=True). Set any to 0 to
+    # disable that augmentation while keeping the others.
+    flip_prob: float = 0.5
+    rotation_max_deg: float = 15.0
+    brightness_jitter: float = 0.15  # +/- fraction of pixel value
+    contrast_jitter: float = 0.15
+    saturation_jitter: float = 0.10
+    hue_jitter: float = 0.03  # in [0, 0.5] (fraction of HSV hue)
 
     def _resize(self, arr: np.ndarray) -> np.ndarray:
         if cv2 is not None:
@@ -158,6 +166,50 @@ class FundusTransform:
         if arr.ndim == 2:
             return arr[ys[:, None], xs[None, :]]
         return arr[ys[:, None], xs[None, :], :]
+
+    def _rotate(self, arr: np.ndarray, angle_deg: float, mask_mode: bool) -> np.ndarray:
+        """Rotate an image (or mask) about its centre by `angle_deg` degrees."""
+        if cv2 is None:
+            return arr  # No-op fallback when opencv is missing
+        H, W = arr.shape[:2]
+        M = cv2.getRotationMatrix2D((W / 2, H / 2), angle_deg, 1.0)
+        flag = cv2.INTER_NEAREST if mask_mode else cv2.INTER_LINEAR
+        return cv2.warpAffine(
+            arr, M, (W, H), flags=flag, borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+    def _color_jitter(self, img: np.ndarray) -> np.ndarray:
+        """Randomly perturb brightness, contrast, saturation, and hue.
+
+        Numpy-only implementation — no torchvision required so that this
+        works on the lean Tier 1 deployment dependency set.
+        """
+        out = img.astype(np.float32)
+
+        # Brightness: add a constant
+        if self.brightness_jitter > 0:
+            shift = (np.random.rand() * 2 - 1) * self.brightness_jitter * 255.0
+            out = out + shift
+
+        # Contrast: scale around the per-channel mean
+        if self.contrast_jitter > 0:
+            scale = 1.0 + (np.random.rand() * 2 - 1) * self.contrast_jitter
+            mean = out.mean(axis=(0, 1), keepdims=True)
+            out = (out - mean) * scale + mean
+
+        # Saturation + hue jitter applied via HSV
+        if (self.saturation_jitter > 0 or self.hue_jitter > 0) and cv2 is not None:
+            out_clipped = np.clip(out, 0, 255).astype(np.uint8)
+            hsv = cv2.cvtColor(out_clipped, cv2.COLOR_RGB2HSV).astype(np.float32)
+            if self.saturation_jitter > 0:
+                s_scale = 1.0 + (np.random.rand() * 2 - 1) * self.saturation_jitter
+                hsv[..., 1] = np.clip(hsv[..., 1] * s_scale, 0, 255)
+            if self.hue_jitter > 0:
+                h_shift = (np.random.rand() * 2 - 1) * self.hue_jitter * 180.0
+                hsv[..., 0] = (hsv[..., 0] + h_shift) % 180
+            out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
+
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def __call__(
         self,
@@ -179,20 +231,41 @@ class FundusTransform:
         if img.ndim == 2:
             img = np.stack([img] * 3, axis=-1)
 
-        # Random horizontal flip for training augmentation
-        if self.train and np.random.rand() < 0.5:
-            img = img[:, ::-1].copy()
-            if disc_mask is not None:
-                disc_mask = self._resize(disc_mask)
-                disc_mask = disc_mask[:, ::-1].copy()
-            if cup_mask is not None:
-                cup_mask = self._resize(cup_mask)
-                cup_mask = cup_mask[:, ::-1].copy()
-        else:
-            if disc_mask is not None:
-                disc_mask = self._resize(disc_mask)
-            if cup_mask is not None:
-                cup_mask = self._resize(cup_mask)
+        # Resize masks to match image size
+        if disc_mask is not None:
+            disc_mask = self._resize(disc_mask)
+        if cup_mask is not None:
+            cup_mask = self._resize(cup_mask)
+
+        # Training-time augmentations
+        if self.train:
+            # Random horizontal flip
+            if self.flip_prob > 0 and np.random.rand() < self.flip_prob:
+                img = img[:, ::-1].copy()
+                if disc_mask is not None:
+                    disc_mask = disc_mask[:, ::-1].copy()
+                if cup_mask is not None:
+                    cup_mask = cup_mask[:, ::-1].copy()
+
+            # Random rotation around image centre
+            if self.rotation_max_deg > 0:
+                angle = (np.random.rand() * 2 - 1) * self.rotation_max_deg
+                img = self._rotate(img, angle, mask_mode=False)
+                if disc_mask is not None:
+                    disc_mask = self._rotate(disc_mask, angle, mask_mode=True)
+                if cup_mask is not None:
+                    cup_mask = self._rotate(cup_mask, angle, mask_mode=True)
+
+            # Color jitter (image only)
+            if any(
+                v > 0 for v in (
+                    self.brightness_jitter,
+                    self.contrast_jitter,
+                    self.saturation_jitter,
+                    self.hue_jitter,
+                )
+            ):
+                img = self._color_jitter(img)
 
         # Polar preprocessing (applied AFTER resize so the radius is consistent)
         if self.polar:

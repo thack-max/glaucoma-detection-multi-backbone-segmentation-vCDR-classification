@@ -57,7 +57,7 @@ def classify_risk(
 ) -> RiskLevel:
     """Classify risk level from the screening score and vCDR.
 
-    Uses the RETFound-based risk score as the primary determinant,
+    Uses the DINOv2-based risk score as the primary determinant,
     with vCDR as a safety-net escalation (if vCDR is very high,
     escalate even if the risk score is moderate).
 
@@ -102,7 +102,7 @@ class ReferralPacket:
     disc_mask_path: str = ""
     cup_mask_path: str = ""
     overlay_path: str = ""
-    retfound_embedding_path: str = ""
+    dinov2_embedding_path: str = ""
 
     # Referral details
     referral_reason: str = ""
@@ -124,7 +124,7 @@ class ReferralPacket:
             "disc_mask_path": self.disc_mask_path,
             "cup_mask_path": self.cup_mask_path,
             "overlay_path": self.overlay_path,
-            "retfound_embedding_path": self.retfound_embedding_path,
+            "dinov2_embedding_path": self.dinov2_embedding_path,
             "referral_reason": self.referral_reason,
             "urgency": self.urgency,
             "demographics": self.demographics,

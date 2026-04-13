@@ -387,7 +387,7 @@ class SpecialistPipeline:
             "tier1_vcdr": referral.vcdr,
             "urgency": referral.urgency,
             "has_fundus_segmentation": bool(referral.disc_mask_path),
-            "has_dinov2_embedding": bool(referral.retfound_embedding_path),
+            "has_dinov2_embedding": bool(referral.dinov2_embedding_path),
             "needs_oct": True,
             "needs_longitudinal": True,
             "demographics": referral.demographics,

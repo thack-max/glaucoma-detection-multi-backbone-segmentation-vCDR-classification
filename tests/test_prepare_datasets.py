@@ -346,3 +346,63 @@ class TestPrepareLongitudinal:
 
         patients = {r["patient_id"] for r in rows}
         assert patients == {"P2"}
+
+
+class TestPrepareHarvardGF:
+    def test_end_to_end_with_summary_csv(self, tmp_path: Path):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        (src / "Training").mkdir(parents=True)
+        (src / "Validation").mkdir(parents=True)
+
+        # Synthesize 4 .npz files (2 train, 2 val) with image arrays
+        rng = np.random.default_rng(0)
+        for i in range(2):
+            np.savez(
+                src / "Training" / f"data_{i:04d}.npz",
+                image=rng.integers(0, 255, (32, 32, 3), dtype=np.uint8),
+            )
+        for i in range(2):
+            np.savez(
+                src / "Validation" / f"data_{i + 100:04d}.npz",
+                image=rng.integers(0, 255, (32, 32, 3), dtype=np.uint8),
+            )
+
+        with open(src / "data_summary.csv", "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["filename", "race", "gender", "label"],
+            )
+            writer.writeheader()
+            writer.writerow({"filename": "data_0000.npz", "race": "Asian", "gender": "F", "label": "0"})
+            writer.writerow({"filename": "data_0001.npz", "race": "Black", "gender": "M", "label": "1"})
+            writer.writerow({"filename": "data_0100.npz", "race": "White", "gender": "F", "label": "0"})
+            writer.writerow({"filename": "data_0101.npz", "race": "Black", "gender": "M", "label": "1"})
+
+        result = _run_script(
+            "prepare_harvard_gf.py",
+            "--source", str(src),
+            "--output", str(out),
+        )
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+
+        with open(out / "manifest.csv") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 4
+
+        # group_id mapped from race
+        group_ids = {r["group_id"] for r in rows}
+        assert group_ids == {"0", "1", "2"}
+
+        # Labels propagated
+        labels = sorted(r["label"] for r in rows)
+        assert labels == ["0", "0", "1", "1"]
+
+        # Splits assigned correctly
+        splits = {r["split"] for r in rows}
+        assert splits == {"train", "val"}
+
+        # Images extracted
+        for row in rows:
+            assert (out / row["image_path"]).exists()
+
+

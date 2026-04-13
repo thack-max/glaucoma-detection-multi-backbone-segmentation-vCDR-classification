@@ -65,6 +65,68 @@ def test_polar_transform_preserves_shape():
     assert not torch.allclose(cartesian["image"], polar["image"])
 
 
+def test_train_augmentations_change_image():
+    """Color jitter / rotation should produce different outputs across calls."""
+    transform = FundusTransform(
+        image_size=32, train=True,
+        flip_prob=0.0,  # disable flip to keep test deterministic across pixel comparison
+        rotation_max_deg=15.0,
+        brightness_jitter=0.2,
+        contrast_jitter=0.2,
+    )
+    image = np.full((64, 64, 3), 128, dtype=np.uint8)
+    # Add some structure so rotation actually changes pixels
+    image[20:40, 20:40] = 200
+
+    np.random.seed(0)
+    out_a = transform(image)["image"]
+    np.random.seed(1)
+    out_b = transform(image)["image"]
+    # Different RNG seeds -> different augmented outputs
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_train_augmentations_disabled_when_train_false():
+    """train=False must produce a deterministic output even if augmentation knobs are non-zero."""
+    transform = FundusTransform(
+        image_size=32, train=False,
+        rotation_max_deg=30.0, brightness_jitter=0.5,
+    )
+    image = np.full((64, 64, 3), 100, dtype=np.uint8)
+    a = transform(image)["image"]
+    b = transform(image)["image"]
+    assert torch.allclose(a, b)
+
+
+def test_rotation_preserves_mask_alignment():
+    """A disc mask that's fully inside the disc should stay inside after rotation."""
+    transform = FundusTransform(
+        image_size=64, train=True,
+        flip_prob=0.0, rotation_max_deg=10.0,
+        brightness_jitter=0.0, contrast_jitter=0.0,
+        saturation_jitter=0.0, hue_jitter=0.0,
+    )
+    H = W = 128
+    image = np.zeros((H, W, 3), dtype=np.uint8)
+    disc = np.zeros((H, W), dtype=np.uint8)
+    cup = np.zeros((H, W), dtype=np.uint8)
+    yy, xx = np.ogrid[:H, :W]
+    disc_mask = ((yy - H // 2) ** 2 + (xx - W // 2) ** 2) < 30 ** 2
+    cup_mask = ((yy - H // 2) ** 2 + (xx - W // 2) ** 2) < 12 ** 2
+    disc[disc_mask] = 1
+    cup[cup_mask] = 1
+    image[disc_mask] = 200
+
+    out = transform(image, disc_mask=disc, cup_mask=cup)
+    # Cup should still be entirely contained within the disc after rotation
+    cup_pixels = out["cup_mask"] > 0.5
+    disc_pixels = out["disc_mask"] > 0.5
+    # Allow up to 5% of cup pixels to fall outside disc due to interpolation
+    if cup_pixels.sum() > 0:
+        leak = (cup_pixels & ~disc_pixels).sum().item() / cup_pixels.sum().item()
+        assert leak < 0.10
+
+
 def test_polar_transform_with_masks():
     """Polar preprocessing warps masks alongside the image."""
     image = np.zeros((64, 64, 3), dtype=np.uint8)

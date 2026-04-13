@@ -123,8 +123,7 @@ Every component is anchored to published, peer-reviewed work.
 │   ├── tier/                    # Deployment configs per tier
 │   │   ├── screening.yaml       # Tier 1: BoundaryFormer + DINOv2, CPU
 │   │   └── specialist.yaml      # Tier 2: full multimodal + Mamba, GPU
-│   ├── data/                    # Dataset configs
-│   └── model/                   # Per-component training configs
+│   └── model/                   # Per-component training configs (vlm.yaml)
 ├── src/
 │   ├── data/                    # Dataset classes, transforms
 │   ├── models/
@@ -147,8 +146,7 @@ Every component is anchored to published, peer-reviewed work.
 │   ├── train_segmentation.py    # Train BoundaryFormer
 │   ├── train_progression.py     # Train Delta-t Mamba + Evidential Forecaster
 │   └── evaluate.py              # Tier-specific evaluation (--tier flag)
-├── tests/                       # Unit tests
-└── notebooks/                   # Exploration notebooks
+└── tests/                       # Unit tests (135+ passing)
 ```
 
 ## Quick Start
