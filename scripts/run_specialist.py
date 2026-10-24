@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -25,14 +26,61 @@ from src.data.transforms import get_fundus_transforms
 from src.data.fundus_dataset import _read_image
 from src.pipeline.common import ReferralPacket
 from src.pipeline.specialist import SpecialistPipeline
+from src.utils.checkpoints import (
+    load_checkpoint,
+    load_into,
+    random_encoder_warning,
+    untrained_warning,
+)
+
+# The copy shipped with the package (configs/ ships beside scripts/), so the
+# installed `glaucoma-specialist` command works from any directory.
+PACKAGED_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "tier" / "specialist.yaml"
+# The original cwd-relative default: a project directory's own edited copy.
+LOCAL_CONFIG = Path("configs") / "tier" / "specialist.yaml"
+
+
+def default_config() -> Path:
+    """Default --config: ./configs/tier/specialist.yaml if present, else the packaged copy."""
+    return LOCAL_CONFIG if LOCAL_CONFIG.is_file() else PACKAGED_CONFIG
+
+
+class CheckpointLoadError(RuntimeError):
+    """A configured checkpoint is missing or does not fit its module."""
 
 
 def _safe_build(fn, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
+    except CheckpointLoadError:
+        # The user asked for trained weights: never fall back to random ones.
+        raise
     except Exception as exc:  # noqa: BLE001
         print(f"  [skip] {fn.__name__}: {exc}")
         return None
+
+
+def _load_weights(model, checkpoint: str | None, keys: list[str], name: str):
+    """Strictly load `checkpoint`'s state dict (first of `keys` present) into `model`.
+
+    No checkpoint configured: keep the random init but say so loudly.
+    """
+    if not checkpoint:
+        print(f"  {untrained_warning(name, 'no checkpoint configured')}", file=sys.stderr)
+        return model
+    try:
+        ckpt = load_checkpoint(checkpoint)
+        if not load_into(model, ckpt, key_candidates=keys, strict=True):
+            raise KeyError(
+                f"none of {keys} in checkpoint (found {sorted(ckpt['state_dicts'])})"
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise CheckpointLoadError(f"{name}: cannot load {checkpoint}: {exc}") from exc
+    print(f"  Loaded {name} weights: {checkpoint}")
+    message = random_encoder_warning(ckpt, checkpoint)
+    if message:
+        print(f"  {message}", file=sys.stderr)
+    return model
 
 
 def _load_segmenter(cfg: dict):
@@ -42,11 +90,8 @@ def _load_segmenter(cfg: dict):
         base_channels=cfg.get("base_channels", 64),
         growth_rate=cfg.get("growth_rate", 32),
     )
-    ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
-    return model.eval()
+    # "model" is the key scripts/train_segmentation.py writes.
+    return _load_weights(model, cfg.get("checkpoint"), ["model"], "fundus segmenter").eval()
 
 
 def _load_oct_segmenter(cfg: dict):
@@ -58,65 +103,93 @@ def _load_oct_segmenter(cfg: dict):
         depths=tuple(cfg.get("depths", [2, 2, 2, 2])),
         num_heads=tuple(cfg.get("num_heads", [3, 6, 12, 24])),
     )
-    ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
-    return model.eval()
+    # No OCT trainer ships yet; same {"model": state_dict} layout as the
+    # fundus segmenter (a raw state_dict also loads).
+    return _load_weights(model, cfg.get("checkpoint"), ["model"], "OCT segmenter").eval()
 
 
 def _load_encoder(cfg: dict):
     from src.models.features.dinov2_encoder import DINOv2Encoder
-    return DINOv2Encoder(
+    encoder = DINOv2Encoder(
         variant=cfg.get("variant", "dinov2_vitb14"),
         freeze_encoder=cfg.get("freeze_encoder", True),
         use_registers=cfg.get("use_registers", False),
-    ).eval()
+    )
+    if not getattr(encoder, "pretrained_loaded", True):
+        print(
+            "  " + untrained_warning(
+                "DINOv2 encoder",
+                "pretrained weights could not be downloaded via torch.hub: network, "
+                "proxy or I/O error; the RuntimeWarning above names it",
+            ),
+            file=sys.stderr,
+        )
+    return encoder.eval()
 
 
 def _load_vf_graph_net(cfg: dict):
     from src.models.progression.vf_graph_net import VFGraphNet
-    return VFGraphNet(
+    model = VFGraphNet(
         node_features=cfg.get("node_features", 3),
         hidden_dim=cfg.get("hidden_dim", 128),
         num_gin_layers=cfg.get("num_gin_layers", 4),
         output_dim=cfg.get("output_dim", 128),
-    ).eval()
+    )
+    # Key written by scripts/train_specialist.py
+    return _load_weights(model, cfg.get("checkpoint"), ["vf_net"], "vf_graph_net").eval()
 
 
 def _load_temporal_encoder(cfg: dict):
     from src.models.progression.delta_t_mamba import DeltaTMamba
-    return DeltaTMamba(
+    model = DeltaTMamba(
         input_dim=cfg.get("input_dim", 768),
         d_model=cfg.get("d_model", 512),
         d_state=cfg.get("d_state", 16),
         num_layers=cfg.get("num_layers", 4),
         expand=cfg.get("expand", 2),
         dropout=cfg.get("dropout", 0.2),
+    )
+    # Keys written by scripts/train_specialist.py and scripts/train_progression.py
+    return _load_weights(
+        model, cfg.get("checkpoint"), ["temporal", "mamba"], "temporal_encoder",
     ).eval()
 
 
 def _load_forecaster(cfg: dict):
     from src.models.progression.evidential_forecaster import EvidentialForecaster
-    return EvidentialForecaster(
+    model = EvidentialForecaster(
         temporal_dim=cfg.get("temporal_dim", 512),
         clinical_dim=cfg.get("clinical_dim", 0),
         vf_dim=cfg.get("vf_dim", 0),
         hidden_dim=cfg.get("hidden_dim", 256),
         dropout=cfg.get("dropout", 0.3),
         num_classes=cfg.get("num_classes", 2),
-    ).eval()
+    )
+    return _load_weights(model, cfg.get("checkpoint"), ["forecaster"], "forecaster").eval()
 
 
 def _load_fusion(cfg: dict):
     from src.models.fusion.cross_modal_attention import CrossModalFusion
-    return CrossModalFusion(
+    model = CrossModalFusion(
         modality_dims=cfg.get("modality_dims", {"fundus": 768, "oct": 768}),
         fused_dim=cfg.get("fused_dim", 512),
         num_heads=cfg.get("num_heads", 4),
         dropout=cfg.get("dropout", 0.2),
         mc_samples=cfg.get("mc_samples", 10),
-    ).eval()
+    )
+    # Key written by scripts/train_specialist.py
+    return _load_weights(model, cfg.get("checkpoint"), ["fusion"], "fusion").eval()
+
+
+def _load_vlm_reporter(cfg: dict):
+    """Llama 3.2 Vision reporter; weights load lazily on the first report."""
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+    return LlamaVisionReporter(
+        model_name=cfg.get("model", "meta-llama/Llama-3.2-11B-Vision-Instruct"),
+        lora_rank=cfg.get("lora_rank", 16),
+        max_new_tokens=cfg.get("max_new_tokens", 512),
+        load_in_4bit=cfg.get("load_in_4bit", True),
+    )
 
 
 def _load_patient_dir(patient_dir: Path) -> dict:
@@ -185,6 +258,9 @@ def _serialize_output(output, patient_id: str, referral: ReferralPacket | None) 
         "predicted_rnfl_thickness": output.predicted_rnfl_thickness,
         "rnfl_aleatoric_uncertainty": output.rnfl_aleatoric_uncertainty,
         "rnfl_epistemic_uncertainty": output.rnfl_epistemic_uncertainty,
+        # Model inputs the patient had no data for, zero-filled ("vf",
+        # "clinical", or single clinical.json fields such as "clinical.age").
+        "imputed_modalities": list(output.imputed_modalities),
         "clinical_report": output.clinical_report,
         "vlm_report_is_experimental": output.vlm_report_is_experimental,
         "requires_specialist_review": output.requires_specialist_review,
@@ -196,7 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patient-dir", type=str, help="Directory with patient multimodal data")
     parser.add_argument("--referral", type=str, help="Path to Tier 1 referral JSON")
     parser.add_argument("--oct", type=str, help="Path to OCT volume (.npy)")
-    parser.add_argument("--config", type=str, default="configs/tier/specialist.yaml")
+    parser.add_argument("--config", type=str, default=str(default_config()))
     parser.add_argument("--enable-vlm", action="store_true")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -206,6 +282,8 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    # Always say which file was used: the default depends on the cwd.
+    print(f"Config: {Path(args.config).resolve()}")
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
@@ -226,6 +304,9 @@ def main():
     temporal_encoder = _safe_build(_load_temporal_encoder, config.get("progression", {}).get("temporal_encoder", {}))
     forecaster = _safe_build(_load_forecaster, config.get("progression", {}).get("forecaster", {}))
     fusion_module = _safe_build(_load_fusion, config.get("fusion", {}))
+    report_generator = None
+    if enable_vlm:
+        report_generator = _safe_build(_load_vlm_reporter, config.get("vlm", {}))
 
     for name, mod in [
         ("segmenter", segmenter),
@@ -247,6 +328,7 @@ def main():
         temporal_encoder=temporal_encoder,
         forecaster=forecaster,
         fusion_module=fusion_module,
+        report_generator=report_generator,
         device=device,
         enable_vlm=enable_vlm,
     )
@@ -304,6 +386,13 @@ def main():
             f"(p={output.progression_probability:.2f}, "
             f"uncertainty={output.progression_uncertainty:.3f})"
         )
+    if output.imputed_modalities:
+        print(
+            f"  WARNING: model inputs zero-filled (missing data): "
+            f"{', '.join(output.imputed_modalities)}"
+        )
+    if enable_vlm and output.clinical_report is None:
+        print("VLM report: not generated (model could not be loaded or generation failed)")
 
 
 if __name__ == "__main__":

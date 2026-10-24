@@ -71,6 +71,7 @@ def save_checkpoint(
 def load_checkpoint(
     path: str | Path,
     map_location: str | torch.device = "cpu",
+    weights_only: bool = True,
 ) -> dict[str, Any]:
     """Load a checkpoint and return a normalized dict.
 
@@ -78,6 +79,14 @@ def load_checkpoint(
       1. New format: {"format_version": "...", "state_dicts": {...}, ...}
       2. Legacy dict-of-state-dicts: {"model": sd, "classifier": sd, ...}
       3. Raw state_dict (OrderedDict of tensors).
+
+    Args:
+        path: Checkpoint file.
+        map_location: Passed to torch.load.
+        weights_only: Passed to torch.load. Keep the default (True) for any
+            file you did not write yourself: with False, unpickling can run
+            arbitrary code. Every layout the training scripts write (state
+            dicts plus plain-Python metadata) loads with True.
 
     Returns:
         {
@@ -91,7 +100,7 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    raw = torch.load(path, map_location=map_location, weights_only=False)
+    raw = torch.load(path, map_location=map_location, weights_only=weights_only)
 
     # Case 1: new canonical format
     if isinstance(raw, dict) and raw.get("format_version", "").startswith("glaucomamba-ckpt"):
@@ -187,3 +196,55 @@ def load_into(
         return True
 
     return False
+
+
+def load_strict(
+    module: nn.Module,
+    path: str | Path,
+    key_candidates: list[str],
+    name: str,
+) -> nn.Module:
+    """Load `path` into `module` (weights_only, strict) or raise.
+
+    For inference entry points: a checkpoint the user configured must either
+    load completely or fail loudly, never leave the module on random weights.
+
+    Raises:
+        FileNotFoundError: `path` does not exist.
+        RuntimeError: no state dict under `key_candidates` (or a single
+            state dict) fits `module`.
+    """
+    ckpt = load_checkpoint(path)
+    try:
+        loaded = load_into(module, ckpt, key_candidates=key_candidates, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{name}: cannot load {path}: {exc}") from exc
+    if not loaded:
+        raise RuntimeError(
+            f"{name}: no {key_candidates} weights in {path} "
+            f"(state dicts found: {sorted(ckpt['state_dicts'])})"
+        )
+    return module
+
+
+def random_encoder_warning(checkpoint: dict[str, Any], path: str | Path) -> str | None:
+    """Warning for a checkpoint trained on a randomly initialised DINOv2, else None.
+
+    The scripts/train_*.py trainers record ``encoder_pretrained`` (False only
+    for an ``--allow-random-encoder`` run); `checkpoint` is load_checkpoint()'s
+    output.
+    """
+    if checkpoint.get("metadata", {}).get("encoder_pretrained") is False:
+        return (
+            f"WARNING: {path} was trained on a RANDOMLY INITIALISED DINOv2 encoder "
+            f"(--allow-random-encoder smoke run): its outputs are meaningless."
+        )
+    return None
+
+
+def untrained_warning(component: str, reason: str) -> str:
+    """One-line warning for an inference CLI running a module on random weights."""
+    return (
+        f"WARNING: {component} is UNTRAINED ({reason}): it runs on random "
+        f"weights, so its outputs are meaningless."
+    )

@@ -43,12 +43,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from src.data.fundus_dataset import FundusDataset
 from src.data.transforms import get_fundus_transforms
@@ -59,7 +59,9 @@ from src.evaluation.metrics import (
     sensitivity_at_specificity,
     specificity_at_sensitivity,
 )
+from src.models.classifier_head import load_screening_head
 from src.pipeline.screening import ScreeningPipeline
+from src.utils.checkpoints import load_strict, untrained_warning
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +129,17 @@ def _try_build_segmenter(checkpoint_path: str | None, device: str):
     from src.models.segmentation.boundary_former import BoundaryFormer
 
     model = BoundaryFormer(num_classes=3, base_channels=64, growth_rate=32)
-    if checkpoint_path and Path(checkpoint_path).exists():
-        state = torch.load(checkpoint_path, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
+    if checkpoint_path:
+        # Strict: a missing or mismatched checkpoint raises. "model" is the
+        # key scripts/train_segmentation.py writes.
+        load_strict(model, checkpoint_path, ["model"], "BoundaryFormer segmenter")
         print(f"Loaded segmenter: {checkpoint_path}")
+    else:
+        print(
+            untrained_warning("BoundaryFormer segmenter", "--segmenter-checkpoint not given")
+            + " vCDR (and so the baseline) is not meaningful.",
+            file=sys.stderr,
+        )
     model.eval()
     return model.to(device)
 
@@ -139,22 +148,37 @@ def _try_build_encoder(variant: str, device: str):
     from src.models.features.dinov2_encoder import DINOv2Encoder
 
     encoder = DINOv2Encoder(variant=variant, freeze_encoder=True)
+    if not getattr(encoder, "pretrained_loaded", True):
+        print(
+            untrained_warning(
+                "DINOv2 encoder",
+                "pretrained weights could not be downloaded via torch.hub: network, "
+                "proxy or I/O error; the RuntimeWarning above names it",
+            ) + " GlaucoMamba scores are not meaningful.",
+            file=sys.stderr,
+        )
     encoder.eval()
     return encoder.to(device)
 
 
 def _try_build_classifier(checkpoint_path: str | None, input_dim: int, device: str):
-    head = nn.Sequential(
-        nn.LayerNorm(input_dim),
-        nn.Dropout(0.3),
-        nn.Linear(input_dim, 1),
-    )
-    if checkpoint_path and Path(checkpoint_path).exists():
-        state = torch.load(checkpoint_path, map_location="cpu")
-        head.load_state_dict(state.get("classifier", state), strict=False)
+    """Return (head, equity_or_None); a train_fairness.py checkpoint brings its EquityModule."""
+    # Same head class train_screening_classifier.py / train_fairness.py save;
+    # loaded strictly.
+    head, equity = load_screening_head(checkpoint_path, input_dim)
+    if checkpoint_path:
         print(f"Loaded classifier: {checkpoint_path}")
+        if equity is not None:
+            print(f"Loaded EquityModule ({equity.equity_attn.num_groups} groups): {checkpoint_path}")
+            equity = equity.eval().to(device)
+    else:
+        print(
+            untrained_warning("Classifier head", "--classifier-checkpoint not given")
+            + " GlaucoMamba scores are not meaningful.",
+            file=sys.stderr,
+        )
     head.eval()
-    return head.to(device)
+    return head.to(device), equity
 
 
 def _run_pipeline_over_dataset(
@@ -213,7 +237,9 @@ def _run_ab_evaluation(args: argparse.Namespace) -> None:
     # Build shared components once
     segmenter = _try_build_segmenter(args.segmenter_checkpoint, device)
     encoder = _try_build_encoder(args.dinov2_variant, device)
-    classifier = _try_build_classifier(args.classifier_checkpoint, encoder.embed_dim, device)
+    classifier, equity = _try_build_classifier(
+        args.classifier_checkpoint, encoder.embed_dim, device,
+    )
 
     # Two pipelines backed by the SAME segmenter + encoder + classifier so
     # that the only difference between runs is the baseline_mode switch.
@@ -221,6 +247,7 @@ def _run_ab_evaluation(args: argparse.Namespace) -> None:
         segmenter=segmenter,
         feature_encoder=encoder,
         classifier_head=classifier,
+        equity_module=equity,
         device=device,
         baseline_mode=True,
     )
@@ -228,6 +255,7 @@ def _run_ab_evaluation(args: argparse.Namespace) -> None:
         segmenter=segmenter,
         feature_encoder=encoder,
         classifier_head=classifier,
+        equity_module=equity,
         device=device,
         baseline_mode=False,
     )

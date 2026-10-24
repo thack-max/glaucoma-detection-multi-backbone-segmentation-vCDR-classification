@@ -77,52 +77,59 @@ class DINOv2GradCAM:
         Returns:
             Heatmap [B, H, W] in [0, 1], one per batch element.
         """
-        encoder_was_training = self.encoder.training
-        classifier_was_training = self.classifier.training
+        # Restore each submodule's own mode afterwards, not just the top-level
+        # flag: a wrapper built on the fly (e.g. nn.Sequential(equity, head))
+        # starts in training mode, and .train() on it would leave the wrapped
+        # inference modules with dropout active.
+        modes = {
+            m: m.training
+            for root in (self.encoder, self.classifier)
+            for m in root.modules()
+        }
         self.encoder.eval()
         self.classifier.eval()
 
-        # Temporarily enable grad on encoder parameters that may be frozen —
-        # we only need gradients to flow *through* the computation, not to
-        # update the weights. Autograd will still compute them.
-        with torch.enable_grad():
-            image = image.detach().clone().requires_grad_(False)
-            patch_feats = self.encoder.extract_patch_features(image)
+        try:
+            # Grad-CAM needs d(target)/d(patch tokens) only, so the encoder
+            # runs without autograd and its patch tokens become a fresh leaf.
+            # This works for frozen encoders (the shipped screening config
+            # sets freeze_encoder: true) and never touches encoder weights.
+            with torch.no_grad():
+                patch_feats = self.encoder.extract_patch_features(image)
             if patch_feats.ndim != 3:
                 raise ValueError(
                     f"Expected patch features of shape [B, N, D], got {patch_feats.shape}"
                 )
-            patch_feats.retain_grad()
 
-            # Mean-pool as a differentiable proxy for the CLS token
-            cls_embed = patch_feats.mean(dim=1)  # [B, D]
-            logits = self.classifier(cls_embed)
+            with torch.enable_grad():
+                patch_feats = patch_feats.detach().requires_grad_(True)
+                # Mean-pool as a differentiable proxy for the CLS token
+                cls_embed = patch_feats.mean(dim=1)  # [B, D]
+                logits = self.classifier(cls_embed)
 
-            if logits.ndim == 1:
-                logits = logits.unsqueeze(-1)
-            target = self._select_target(logits, target_class)
-            target.sum().backward()
+                if logits.ndim == 1:
+                    logits = logits.unsqueeze(-1)
+                target = self._select_target(logits, target_class)
+                (grads,) = torch.autograd.grad(
+                    target.sum(), patch_feats, allow_unused=True,
+                )  # [B, N, D]
+        finally:
+            for module, was_training in modes.items():
+                module.training = was_training  # exact restore, non-recursive
 
-        grads = patch_feats.grad  # [B, N, D]
         if grads is None:
             raise RuntimeError(
                 "Grad-CAM failed: no gradient flowed to the patch features. "
-                "Make sure the classifier head has trainable parameters."
+                "Make sure the classifier head uses its input."
             )
 
         # Grad-CAM: channel-wise importance = mean gradient across patches
+        patch_feats = patch_feats.detach()
         weights = grads.mean(dim=1, keepdim=True)  # [B, 1, D]
         cam = (patch_feats * weights).sum(dim=-1)  # [B, N]
         cam = F.relu(cam)
 
-        heatmap = self._reshape_to_2d(cam, image.shape[-2:])
-
-        if encoder_was_training:
-            self.encoder.train()
-        if classifier_was_training:
-            self.classifier.train()
-
-        return heatmap
+        return self._reshape_to_2d(cam, image.shape[-2:])
 
     @staticmethod
     def _select_target(logits: torch.Tensor, target_class: int | None) -> torch.Tensor:

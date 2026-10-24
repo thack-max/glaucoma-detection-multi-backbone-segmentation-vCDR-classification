@@ -151,3 +151,33 @@ def test_load_into_returns_false_when_no_match(tmp_path: Path):
     ckpt = load_checkpoint(tmp_path / "multi.pth")
     fresh = _Dummy()
     assert load_into(fresh, ckpt, key_candidates=["nonexistent"]) is False
+
+
+class _PickledPayload:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        import os
+
+        return (os.mkdir, (str(self.marker),))
+
+
+def test_load_checkpoint_refuses_arbitrary_pickles_by_default(tmp_path: Path):
+    """weights_only=True by default: unpickling a checkpoint must not run code."""
+    import pickle
+
+    import pytest
+
+    marker = tmp_path / "payload_ran"
+    path = tmp_path / "evil.pth"
+    torch.save({"model": _Dummy().state_dict(), "note": _PickledPayload(marker)}, path)
+
+    with pytest.raises(pickle.UnpicklingError):
+        load_checkpoint(path)
+    assert not marker.exists()
+
+    # Explicit opt-in for trusted files still works.
+    ckpt = load_checkpoint(path, weights_only=False)
+    assert "model" in ckpt["state_dicts"]
+    assert marker.exists()

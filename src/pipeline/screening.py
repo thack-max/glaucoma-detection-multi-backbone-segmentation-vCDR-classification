@@ -148,9 +148,13 @@ class ScreeningPipeline:
             if self.feature_encoder is not None:
                 embedding = self.feature_encoder(fundus_image.to(self.device))
 
-                # Apply equity attention if demographics available
-                if self.equity_module is not None and demographics and "group_id" in demographics:
-                    group_id = torch.tensor([demographics["group_id"]], device=self.device)
+                # A head trained with equity attention (train_fairness.py) scores
+                # EquityModule outputs, so apply it whenever it is present; the
+                # per-group bias is added only when the group is known.
+                if self.equity_module is not None:
+                    group_id = None
+                    if demographics and "group_id" in demographics:
+                        group_id = torch.tensor([demographics["group_id"]], device=self.device)
                     embedding = self.equity_module(embedding, group_id)
 
                 if self.classifier_head is not None:

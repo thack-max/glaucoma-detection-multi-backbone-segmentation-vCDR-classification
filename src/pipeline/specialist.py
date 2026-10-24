@@ -23,12 +23,17 @@ All VLM outputs are always marked experimental with mandatory human review.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
 from src.pipeline.common import ReferralPacket, compute_vcdr
+
+# clinical_data fields, in the order of the clinical feature vector
+# (the forecaster's clinical_dim / fusion's "clinical" modality = 3).
+CLINICAL_FIELDS = ("iop", "age", "sex")
 
 
 @dataclass
@@ -55,6 +60,12 @@ class SpecialistOutput:
     progression_probability: float | None = None
     progression_class: str | None = None  # "stable", "slow", "rapid"
     progression_uncertainty: float | None = None  # Epistemic uncertainty
+
+    # Model inputs this patient had no data for, zero-filled, so the outputs
+    # rest on inputs unlike those seen in training: whole forecaster slots the
+    # model was built with ("clinical", "vf") and absent/null clinical_data
+    # fields fed to the forecaster or fusion module ("clinical.iop", ...).
+    imputed_modalities: list[str] = field(default_factory=list)
 
     # Regression output
     predicted_rnfl_thickness: float | None = None
@@ -155,6 +166,15 @@ class SpecialistPipeline:
         """
         output = SpecialistOutput()
         output.referral_source = referral
+        imputed: list[str] = []
+
+        # [1, 3] clinical vector; absent/null fields are zero-filled (reported
+        # in imputed_modalities once a model consumes the vector).
+        clinical_vec, clinical_missing = None, []
+        if clinical_data is not None and (
+            self.fusion_module is not None or self.forecaster is not None
+        ):
+            clinical_vec, clinical_missing = self._clinical_vector(clinical_data)
 
         # --- Segmentation ---
 
@@ -201,11 +221,14 @@ class SpecialistPipeline:
 
         # --- VF graph analysis ---
 
+        # Graph-level VF-GIN readout [B, readout_dim]: the VF feature handed to
+        # fusion and the forecaster (as in scripts/train_specialist.py).
+        vf_embedding = None
         if vf_data is not None and self.vf_graph_net is not None:
-            output.vf_classification = self.vf_graph_net(vf_data.to(self.device))
-            output.vf_node_importance = self.vf_graph_net.get_node_importance(
-                vf_data.to(self.device)
-            )
+            vf = vf_data.to(self.device)
+            output.vf_classification = self.vf_graph_net(vf)
+            output.vf_node_importance = self.vf_graph_net.get_node_importance(vf)
+            vf_embedding = self.vf_graph_net.encode_graph(vf)
 
         # --- Multimodal fusion (current visit) ---
 
@@ -215,25 +238,18 @@ class SpecialistPipeline:
                 modality_feats["fundus"] = output.dinov2_fundus_embedding
             if output.dinov2_oct_embedding is not None:
                 modality_feats["oct"] = output.dinov2_oct_embedding
-            if output.vf_classification is not None:
-                # Use the logits as a compact VF feature
-                modality_feats["vf"] = output.vf_classification
-            if clinical_data is not None:
-                clin_vec = torch.tensor(
-                    [
-                        float(clinical_data.get("iop", 0.0)),
-                        float(clinical_data.get("age", 0.0)),
-                        float(clinical_data.get("sex", 0.0)),
-                    ],
-                    device=self.device,
-                ).unsqueeze(0)
-                modality_feats["clinical"] = clin_vec
+            if vf_embedding is not None:
+                modality_feats["vf"] = vf_embedding
+            if clinical_vec is not None:
+                modality_feats["clinical"] = clinical_vec
 
             if modality_feats:
                 try:
                     fused = self.fusion_module(modality_feats, return_uncertainty=True)
                     if isinstance(fused, dict):
                         output.fusion_uncertainty = fused.get("std")
+                    if "clinical" in modality_feats:
+                        imputed.extend(clinical_missing)
                 except (RuntimeError, KeyError):
                     # Fused modules may require a strict subset of modalities
                     pass
@@ -256,20 +272,22 @@ class SpecialistPipeline:
                 temporal_embedding = self.temporal_encoder(visit_features, timestamps)
 
                 # Optional clinical + VF auxiliary features for the forecaster
-                clinical_features = None
-                if clinical_data is not None:
-                    clinical_features = torch.tensor(
-                        [
-                            float(clinical_data.get("iop", 0.0)),
-                            float(clinical_data.get("age", 0.0)),
-                            float(clinical_data.get("sex", 0.0)),
-                        ],
-                        device=self.device,
-                    ).unsqueeze(0)
+                clinical_features = clinical_vec
+                vf_features = vf_embedding
 
-                vf_features = None
-                if output.vf_classification is not None:
-                    vf_features = output.vf_classification
+                # Only feed the auxiliary slots the forecaster was built with;
+                # it zero-fills configured slots whose data is missing.
+                if getattr(self.forecaster, "clinical_dim", None) == 0:
+                    clinical_features = None
+                if getattr(self.forecaster, "vf_dim", None) == 0:
+                    vf_features = None
+                if (getattr(self.forecaster, "clinical_dim", 0) or 0) > 0:
+                    if clinical_features is None:
+                        imputed.append("clinical")
+                    else:
+                        imputed.extend(clinical_missing)
+                if vf_features is None and (getattr(self.forecaster, "vf_dim", 0) or 0) > 0:
+                    imputed.append("vf")
 
                 try:
                     forecast = self.forecaster(
@@ -281,6 +299,16 @@ class SpecialistPipeline:
                     forecast = self.forecaster(temporal_embedding)
 
                 self._populate_forecast(output, forecast)
+
+        output.imputed_modalities = list(dict.fromkeys(imputed))  # dedupe, keep order
+        if output.imputed_modalities:
+            warnings.warn(
+                f"No data for {', '.join(output.imputed_modalities)}: these model inputs "
+                "were zero-filled, so treat the progression forecast / fusion output "
+                "with caution (see imputed_modalities).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # --- VLM clinical reporting (experimental, gated) ---
 
@@ -303,7 +331,18 @@ class SpecialistPipeline:
                 )
                 output.clinical_report = report.raw_text
                 output.vlm_report_is_experimental = True
-            except (NotImplementedError, RuntimeError):
+            except (ImportError, OSError, RuntimeError) as exc:
+                # The report is optional and experimental: a reporter that
+                # cannot load (ImportError: missing accelerate/bitsandbytes;
+                # OSError: gated/unreachable weights; RuntimeError: other load
+                # or backend failures, e.g. out of memory) must not discard the
+                # assessment above. Anything else (TypeError, KeyError, ...) is
+                # a bug and propagates.
+                warnings.warn(
+                    f"VLM report not generated: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 output.clinical_report = None
 
         return output
@@ -311,6 +350,27 @@ class SpecialistPipeline:
     # ------------------------------------------------------------------
     # Progression forecasting helpers
     # ------------------------------------------------------------------
+
+    def _clinical_vector(self, clinical_data: dict) -> tuple[torch.Tensor, list[str]]:
+        """[1, 3] tensor of CLINICAL_FIELDS plus the fields zero-filled.
+
+        A field that is absent (keys are lower-case) or null becomes 0.0 and
+        is listed as "clinical.<field>"; a non-numeric value raises.
+        """
+        values: list[float] = []
+        missing: list[str] = []
+        for name in CLINICAL_FIELDS:
+            value = clinical_data.get(name)
+            if value is None:
+                missing.append(f"clinical.{name}")
+                value = 0.0
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"clinical.{name} must be numeric, got {value!r}"
+                ) from exc
+        return torch.tensor(values, device=self.device).unsqueeze(0), missing
 
     def _stack_visit_features(
         self, visit_history: list[dict]
