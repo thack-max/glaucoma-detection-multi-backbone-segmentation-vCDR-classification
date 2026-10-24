@@ -15,21 +15,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 
 from src.data.transforms import get_fundus_transforms
 from src.data.fundus_dataset import _read_image
-from src.models.classifier_head import load_classifier_head
+from src.models.classifier_head import load_screening_head
 from src.models.explainability.gradcam import (
     AttentionRolloutCAM,
     DINOv2GradCAM,
     overlay_heatmap_on_image,
 )
 from src.pipeline.screening import ScreeningPipeline
+from src.utils.checkpoints import load_strict, untrained_warning
 
 # The copy shipped with the package (configs/ ships beside scripts/), so the
 # installed `glaucoma-screen` command works from any directory.
@@ -44,7 +47,11 @@ def default_config() -> Path:
 
 
 def _try_load_segmenter(cfg: dict, device: str):
-    """Build BoundaryFormer and optionally load a checkpoint."""
+    """Build BoundaryFormer and, if configured, strictly load its checkpoint.
+
+    Raises FileNotFoundError / RuntimeError when a configured checkpoint is
+    missing or does not fit (never falls back to random weights silently).
+    """
     try:
         from src.models.segmentation.boundary_former import BoundaryFormer
     except ImportError:
@@ -56,10 +63,16 @@ def _try_load_segmenter(cfg: dict, device: str):
         growth_rate=cfg.get("growth_rate", 32),
     )
     ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
+    if ckpt:
+        # "model" is the key scripts/train_segmentation.py writes.
+        load_strict(model, ckpt, ["model"], "BoundaryFormer segmenter")
         print(f"Loaded segmenter weights: {ckpt}")
+    else:
+        print(
+            untrained_warning("BoundaryFormer segmenter", "segmentation.checkpoint is not set")
+            + " vCDR and the vCDR > 0.5 baseline depend on it.",
+            file=sys.stderr,
+        )
     model.eval()
     return model.to(device)
 
@@ -75,18 +88,68 @@ def _try_load_encoder(cfg: dict, device: str):
         freeze_encoder=cfg.get("freeze_encoder", True),
         use_registers=cfg.get("use_registers", False),
     )
+    if not getattr(model, "pretrained_loaded", True):
+        print(
+            untrained_warning(
+                "DINOv2 encoder",
+                "pretrained weights could not be downloaded via torch.hub: network, "
+                "proxy or I/O error; the RuntimeWarning above names it",
+            ) + " Risk scores are not meaningful.",
+            file=sys.stderr,
+        )
     model.eval()
     return model.to(device)
 
 
-def _try_load_classifier(cfg: dict, device: str):
-    # Same head class train_screening_classifier.py saves; loaded strictly.
+def _try_load_classifier(cfg: dict, device: str, fairness: dict | None = None):
+    """Build the classifier head and, for a fairness checkpoint, its EquityModule.
+
+    The head comes from classifier.checkpoint, or from fairness.checkpoint when
+    fairness is enabled (a train_fairness.py best.pth holds both the head and
+    the EquityModule it was trained behind). Returns (head, equity_or_None).
+    """
+    fairness = fairness or {}
+    # Same default as src/utils/config.py's FairnessSection.
+    fair_enabled = bool(fairness.get("enabled", True))
     ckpt = cfg.get("checkpoint")
-    head = load_classifier_head(ckpt, cfg.get("input_dim", 768))
+    fair_ckpt = fairness.get("checkpoint")
+    if fair_ckpt and not fair_enabled:
+        print(f"fairness.enabled is false: ignoring fairness.checkpoint {fair_ckpt}")
+    if fair_ckpt and fair_enabled:
+        if ckpt and Path(ckpt).resolve() != Path(fair_ckpt).resolve():
+            raise ValueError(
+                f"classifier.checkpoint ({ckpt}) and fairness.checkpoint ({fair_ckpt}) "
+                f"differ: a train_fairness.py head only fits the EquityModule it was "
+                f"trained with. Set one of them (or both to the same file)."
+            )
+        ckpt = fair_ckpt
+    # Same head class train_screening_classifier.py / train_fairness.py save;
+    # loaded strictly.
+    head, equity = load_screening_head(
+        ckpt,
+        cfg.get("input_dim", 768),
+        with_equity=fair_enabled,
+        num_groups=fairness.get("num_groups"),
+    )
+    if fair_ckpt and fair_enabled and equity is None:
+        raise RuntimeError(
+            f"fairness.checkpoint {fair_ckpt} holds no EquityModule ('equity') "
+            f"weights; expected a scripts/train_fairness.py checkpoint."
+        )
     if ckpt:
         print(f"Loaded classifier head: {ckpt}")
+        if equity is not None:
+            print(f"Loaded EquityModule ({equity.equity_attn.num_groups} groups): {ckpt}")
+    else:
+        print(
+            untrained_warning("Classifier head", "classifier.checkpoint is not set")
+            + " Risk scores are not meaningful.",
+            file=sys.stderr,
+        )
     head.eval()
-    return head.to(device)
+    if equity is not None:
+        equity = equity.eval().to(device)
+    return head.to(device), equity
 
 
 def _save_gradcam_overlay(
@@ -107,7 +170,13 @@ def _save_gradcam_overlay(
 
     try:
         if pipeline.classifier_head is not None:
-            explainer = DINOv2GradCAM(encoder, pipeline.classifier_head)
+            head = pipeline.classifier_head
+            if pipeline.equity_module is not None:
+                # The head scores EquityModule outputs (group bias unknown here).
+                # A fresh wrapper starts in train mode: give it the head's mode.
+                head = nn.Sequential(pipeline.equity_module, head)
+                head.training = pipeline.classifier_head.training
+            explainer = DINOv2GradCAM(encoder, head)
             heatmap = explainer(image_tensor)
         else:
             explainer = AttentionRolloutCAM(encoder)
@@ -204,17 +273,21 @@ def main():
     segmenter = _try_load_segmenter(config.get("segmentation", {}), device)
     feature_encoder = None
     classifier_head = None
+    equity_module = None
     if not baseline_mode:
         feature_encoder = _try_load_encoder(config.get("feature_extraction", {}), device)
         if feature_encoder is not None:
             cls_cfg = dict(config.get("classifier", {}))
             cls_cfg.setdefault("input_dim", feature_encoder.embed_dim)
-            classifier_head = _try_load_classifier(cls_cfg, device)
+            classifier_head, equity_module = _try_load_classifier(
+                cls_cfg, device, fairness=config.get("fairness", {}),
+            )
 
     pipeline = ScreeningPipeline(
         segmenter=segmenter,
         feature_encoder=feature_encoder,
         classifier_head=classifier_head,
+        equity_module=equity_module,
         device=device,
         baseline_mode=baseline_mode,
         referral_threshold=config["pipeline"]["referral_threshold"],
@@ -222,6 +295,8 @@ def main():
     )
 
     mode = "BASELINE (vCDR > 0.5)" if baseline_mode else "DINOv2 + BoundaryFormer"
+    if equity_module is not None:
+        mode += " + EquityAttention"
     print(f"Tier 1 Screening Pipeline — Mode: {mode}")
     print(f"Device: {device}")
     print(f"Output: {output_dir}")

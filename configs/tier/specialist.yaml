@@ -31,7 +31,11 @@ feature_extraction:
   variant: dinov2_vitb14
   embed_dim: 768
   freeze_encoder: false  # Fine-tune for specialist tasks
-  use_registers: true
+  # true selects the register-token backbone (torch.hub "<variant>_reg"; cleaner
+  # attention maps) whose features differ from the plain one's. The
+  # scripts/train_*.py trainers fit heads on the plain backbone, so keep false
+  # unless your checkpoints were trained on register features.
+  use_registers: false
 
 visual_field:
   model: vf_graph_net

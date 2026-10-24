@@ -77,8 +77,15 @@ class DINOv2GradCAM:
         Returns:
             Heatmap [B, H, W] in [0, 1], one per batch element.
         """
-        encoder_was_training = self.encoder.training
-        classifier_was_training = self.classifier.training
+        # Restore each submodule's own mode afterwards, not just the top-level
+        # flag: a wrapper built on the fly (e.g. nn.Sequential(equity, head))
+        # starts in training mode, and .train() on it would leave the wrapped
+        # inference modules with dropout active.
+        modes = {
+            m: m.training
+            for root in (self.encoder, self.classifier)
+            for m in root.modules()
+        }
         self.encoder.eval()
         self.classifier.eval()
 
@@ -107,10 +114,8 @@ class DINOv2GradCAM:
                     target.sum(), patch_feats, allow_unused=True,
                 )  # [B, N, D]
         finally:
-            if encoder_was_training:
-                self.encoder.train()
-            if classifier_was_training:
-                self.classifier.train()
+            for module, was_training in modes.items():
+                module.training = was_training  # exact restore, non-recursive
 
         if grads is None:
             raise RuntimeError(

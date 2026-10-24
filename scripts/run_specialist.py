@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +26,12 @@ from src.data.transforms import get_fundus_transforms
 from src.data.fundus_dataset import _read_image
 from src.pipeline.common import ReferralPacket
 from src.pipeline.specialist import SpecialistPipeline
-from src.utils.checkpoints import load_checkpoint, load_into
+from src.utils.checkpoints import (
+    load_checkpoint,
+    load_into,
+    random_encoder_warning,
+    untrained_warning,
+)
 
 # The copy shipped with the package (configs/ ships beside scripts/), so the
 # installed `glaucoma-specialist` command works from any directory.
@@ -55,8 +61,12 @@ def _safe_build(fn, *args, **kwargs):
 
 
 def _load_weights(model, checkpoint: str | None, keys: list[str], name: str):
-    """Strictly load `checkpoint`'s state dict (first of `keys` present) into `model`."""
+    """Strictly load `checkpoint`'s state dict (first of `keys` present) into `model`.
+
+    No checkpoint configured: keep the random init but say so loudly.
+    """
     if not checkpoint:
+        print(f"  {untrained_warning(name, 'no checkpoint configured')}", file=sys.stderr)
         return model
     try:
         ckpt = load_checkpoint(checkpoint)
@@ -67,6 +77,9 @@ def _load_weights(model, checkpoint: str | None, keys: list[str], name: str):
     except Exception as exc:  # noqa: BLE001
         raise CheckpointLoadError(f"{name}: cannot load {checkpoint}: {exc}") from exc
     print(f"  Loaded {name} weights: {checkpoint}")
+    message = random_encoder_warning(ckpt, checkpoint)
+    if message:
+        print(f"  {message}", file=sys.stderr)
     return model
 
 
@@ -77,11 +90,8 @@ def _load_segmenter(cfg: dict):
         base_channels=cfg.get("base_channels", 64),
         growth_rate=cfg.get("growth_rate", 32),
     )
-    ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
-    return model.eval()
+    # "model" is the key scripts/train_segmentation.py writes.
+    return _load_weights(model, cfg.get("checkpoint"), ["model"], "fundus segmenter").eval()
 
 
 def _load_oct_segmenter(cfg: dict):
@@ -93,20 +103,28 @@ def _load_oct_segmenter(cfg: dict):
         depths=tuple(cfg.get("depths", [2, 2, 2, 2])),
         num_heads=tuple(cfg.get("num_heads", [3, 6, 12, 24])),
     )
-    ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
-    return model.eval()
+    # No OCT trainer ships yet; same {"model": state_dict} layout as the
+    # fundus segmenter (a raw state_dict also loads).
+    return _load_weights(model, cfg.get("checkpoint"), ["model"], "OCT segmenter").eval()
 
 
 def _load_encoder(cfg: dict):
     from src.models.features.dinov2_encoder import DINOv2Encoder
-    return DINOv2Encoder(
+    encoder = DINOv2Encoder(
         variant=cfg.get("variant", "dinov2_vitb14"),
         freeze_encoder=cfg.get("freeze_encoder", True),
         use_registers=cfg.get("use_registers", False),
-    ).eval()
+    )
+    if not getattr(encoder, "pretrained_loaded", True):
+        print(
+            "  " + untrained_warning(
+                "DINOv2 encoder",
+                "pretrained weights could not be downloaded via torch.hub: network, "
+                "proxy or I/O error; the RuntimeWarning above names it",
+            ),
+            file=sys.stderr,
+        )
+    return encoder.eval()
 
 
 def _load_vf_graph_net(cfg: dict):
@@ -240,6 +258,9 @@ def _serialize_output(output, patient_id: str, referral: ReferralPacket | None) 
         "predicted_rnfl_thickness": output.predicted_rnfl_thickness,
         "rnfl_aleatoric_uncertainty": output.rnfl_aleatoric_uncertainty,
         "rnfl_epistemic_uncertainty": output.rnfl_epistemic_uncertainty,
+        # Model inputs the patient had no data for, zero-filled ("vf",
+        # "clinical", or single clinical.json fields such as "clinical.age").
+        "imputed_modalities": list(output.imputed_modalities),
         "clinical_report": output.clinical_report,
         "vlm_report_is_experimental": output.vlm_report_is_experimental,
         "requires_specialist_review": output.requires_specialist_review,
@@ -364,6 +385,11 @@ def main():
             f"Progression: {output.progression_class} "
             f"(p={output.progression_probability:.2f}, "
             f"uncertainty={output.progression_uncertainty:.3f})"
+        )
+    if output.imputed_modalities:
+        print(
+            f"  WARNING: model inputs zero-filled (missing data): "
+            f"{', '.join(output.imputed_modalities)}"
         )
     if enable_vlm and output.clinical_report is None:
         print("VLM report: not generated (model could not be loaded or generation failed)")

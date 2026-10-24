@@ -196,3 +196,55 @@ def load_into(
         return True
 
     return False
+
+
+def load_strict(
+    module: nn.Module,
+    path: str | Path,
+    key_candidates: list[str],
+    name: str,
+) -> nn.Module:
+    """Load `path` into `module` (weights_only, strict) or raise.
+
+    For inference entry points: a checkpoint the user configured must either
+    load completely or fail loudly, never leave the module on random weights.
+
+    Raises:
+        FileNotFoundError: `path` does not exist.
+        RuntimeError: no state dict under `key_candidates` (or a single
+            state dict) fits `module`.
+    """
+    ckpt = load_checkpoint(path)
+    try:
+        loaded = load_into(module, ckpt, key_candidates=key_candidates, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{name}: cannot load {path}: {exc}") from exc
+    if not loaded:
+        raise RuntimeError(
+            f"{name}: no {key_candidates} weights in {path} "
+            f"(state dicts found: {sorted(ckpt['state_dicts'])})"
+        )
+    return module
+
+
+def random_encoder_warning(checkpoint: dict[str, Any], path: str | Path) -> str | None:
+    """Warning for a checkpoint trained on a randomly initialised DINOv2, else None.
+
+    The scripts/train_*.py trainers record ``encoder_pretrained`` (False only
+    for an ``--allow-random-encoder`` run); `checkpoint` is load_checkpoint()'s
+    output.
+    """
+    if checkpoint.get("metadata", {}).get("encoder_pretrained") is False:
+        return (
+            f"WARNING: {path} was trained on a RANDOMLY INITIALISED DINOv2 encoder "
+            f"(--allow-random-encoder smoke run): its outputs are meaningless."
+        )
+    return None
+
+
+def untrained_warning(component: str, reason: str) -> str:
+    """One-line warning for an inference CLI running a module on random weights."""
+    return (
+        f"WARNING: {component} is UNTRAINED ({reason}): it runs on random "
+        f"weights, so its outputs are meaningless."
+    )

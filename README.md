@@ -155,7 +155,18 @@ Every component is anchored to published, peer-reviewed work.
 
 ```bash
 pip install -e ".[dev]"
+# Only for --enable-vlm (Llama 3.2 Vision reports): accelerate, bitsandbytes, peft
+pip install -e ".[vlm]"
 ```
+
+bitsandbytes (needed only for `vlm.load_in_4bit: true`, the shipped default)
+has wheels for Linux, Windows and Apple Silicon on macOS 14+; on Intel macOS the
+`[vlm]` extra skips it, so set `vlm.load_in_4bit: false` there.
+
+Both CLIs take `--config`. Without it they use `./configs/tier/screening.yaml`
+(or `specialist.yaml`) **from the current directory** if that file exists,
+otherwise the copy packaged with the install; the first line of output names
+the file used (`Config: ...`).
 
 ### Tier 1: Screening
 
@@ -179,9 +190,61 @@ python scripts/run_specialist.py --patient-dir patient_data/
 # Process a Tier 1 referral
 python scripts/run_specialist.py --referral referral.json --oct scan.npy
 
-# Enable experimental VLM reports
+# Enable experimental VLM reports (needs: pip install -e ".[vlm]", plus access
+# to the gated meta-llama weights: huggingface-cli login)
 python scripts/run_specialist.py --patient-dir data/ --enable-vlm
 ```
+
+If the report cannot be generated (missing `[vlm]` extra, gated weights), the
+assessment is still written with `clinical_report: null` and a warning naming
+the cause. Missing inputs are zero-filled and listed in the output's
+`imputed_modalities`, with a warning: forecaster inputs the config enables
+(`clinical_dim`, `vf_dim`) but the patient lacks (`clinical`, `vf` for a missing
+`clinical.json` / `vf.npy`), and single `clinical.json` fields (keys `iop`,
+`age`, `sex`, lower-case) that are absent or null (`clinical.iop`, ...).
+
+### Checkpoints
+
+Trained weights are set per module in the tier configs. Each key expects the
+state dict its training script writes:
+
+| Config key | Written by | State dict key |
+|---|---|---|
+| `screening.yaml` `segmentation.checkpoint` | `scripts/train_segmentation.py` (`best.pth`) | `model` |
+| `screening.yaml` `classifier.checkpoint` | `scripts/train_screening_classifier.py` | `classifier` |
+| `screening.yaml` `fairness.checkpoint` (or `classifier.checkpoint`) | `scripts/train_fairness.py` (`best.pth`) | `classifier` + `equity` |
+| `specialist.yaml` `segmentation.fundus.checkpoint` | `scripts/train_segmentation.py` | `model` |
+| `specialist.yaml` `segmentation.oct.checkpoint` | (no trainer shipped) | `model` |
+| `specialist.yaml` `visual_field.checkpoint` | `scripts/train_specialist.py` | `vf_net` |
+| `specialist.yaml` `progression.temporal_encoder.checkpoint` | `scripts/train_progression.py` / `train_specialist.py` | `mamba` / `temporal` |
+| `specialist.yaml` `progression.forecaster.checkpoint` | `scripts/train_progression.py` (input dims must match the config) | `forecaster` |
+| `specialist.yaml` `fusion.checkpoint` | `scripts/train_specialist.py` | `fusion` |
+
+`scripts/evaluate.py` takes `--segmenter-checkpoint` and `--classifier-checkpoint`
+(either kind of classifier checkpoint above).
+
+- Checkpoints load with `weights_only=True` and strict key matching. A configured
+  checkpoint that is **missing or does not fit its module now raises** and the
+  CLI exits with an error; it never falls back to random weights.
+- A `train_fairness.py` head was trained on EquityModule outputs, so its
+  EquityModule is loaded from the same file and applied before the head. With
+  `fairness.enabled: false` such a checkpoint is rejected.
+- A module with no checkpoint configured runs untrained (random weights) and the
+  CLI prints `WARNING: <module> is UNTRAINED`. Likewise, if DINOv2's pretrained
+  weights cannot be downloaded via torch.hub (a network, proxy or I/O error,
+  e.g. offline), a randomly initialised ViT is used and both a
+  `RuntimeWarning` naming the error and a CLI warning say so
+  (`DINOv2Encoder.pretrained_loaded` is `False`). Any other torch.hub error
+  (e.g. an unknown model name) is raised.
+- `feature_extraction.use_registers` must match the backbone the heads were
+  trained on. The trainers use the plain DINOv2 backbone, so the shipped
+  configs set it to `false`; `true` loads the register variant
+  (`<variant>_reg`), whose features differ.
+- The trainers (`train_screening_classifier.py`, `train_fairness.py`,
+  `train_progression.py`, `train_specialist.py`) stop if DINOv2's pretrained
+  weights did not load. `--allow-random-encoder` trains anyway (smoke runs) and
+  records `encoder_pretrained: false` in the checkpoint; loading such a
+  checkpoint prints a warning.
 
 ### Evaluation
 

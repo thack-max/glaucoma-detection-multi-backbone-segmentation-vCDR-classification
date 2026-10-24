@@ -7,6 +7,9 @@ synthetic in-memory data, not on real pretrained DINOv2 / GPU runs.
 from __future__ import annotations
 
 import csv
+import importlib
+import sys
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -230,3 +233,80 @@ class TestFundusDatasetGroupId:
         sample = ds[0]
         assert "group_id" in sample
         assert "label" in sample
+
+
+# ---------------------------------------------------------------------------
+# Trainers must not fit heads on a randomly initialised DINOv2
+# ---------------------------------------------------------------------------
+
+# trainer -> (needs a fundus manifest, extra argv given the output dir)
+TRAINERS = {
+    "train_screening_classifier": (True, lambda out: ["--output", str(out / "head.pth"),
+                                                      "--image-size", "32"]),
+    "train_fairness": (True, lambda out: ["--output-dir", str(out), "--image-size", "32"]),
+    # MultimodalGlaucomaDataset: no manifest -> empty dataset (never reached).
+    "train_progression": (False, lambda out: ["--output-dir", str(out), "--device", "cpu"]),
+    "train_specialist": (False, lambda out: ["--output-dir", str(out), "--device", "cpu"]),
+}
+
+
+@pytest.mark.parametrize("trainer", sorted(TRAINERS))
+def test_trainer_refuses_random_encoder(trainer, monkeypatch, tmp_path: Path):
+    # torch.hub unreachable -> DINOv2Encoder falls back to random weights; a
+    # head fitted on those features is meaningless, so training must stop
+    # unless --allow-random-encoder is given.
+    def _offline(*args, **kwargs):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(torch.hub, "load", _offline)
+    needs_manifest, extra = TRAINERS[trainer]
+    root = tmp_path / "data"
+    root.mkdir()
+    if needs_manifest:
+        _write_fundus_manifest(root)
+    module = importlib.import_module(f"scripts.{trainer}")
+    monkeypatch.setattr(
+        sys, "argv",
+        [f"{trainer}.py", "--data-root", str(root), "--dinov2-variant", "dinov2_vits14",
+         "--epochs", "1", *extra(tmp_path / "out")],
+    )
+
+    with pytest.warns(RuntimeWarning, match="RANDOMLY INITIALISED"):
+        with pytest.raises(SystemExit, match="--allow-random-encoder"):
+            module.main()
+    assert not list(tmp_path.rglob("*.pth"))
+
+
+class _RandomStubEncoder(_StubEncoder):
+    """What DINOv2Encoder is after the torch.hub fallback, minus the cost."""
+
+    pretrained_loaded = False
+
+    def __init__(self, variant: str = "dinov2_vits14", freeze_encoder: bool = True, **kwargs):
+        super().__init__(embed_dim=8)
+
+
+def test_screening_trainer_opt_in_records_random_encoder(monkeypatch, tmp_path: Path):
+    from scripts import train_screening_classifier as trainer
+    from src.models.classifier_head import load_screening_head
+
+    root = tmp_path / "data"
+    _write_fundus_manifest(root)
+    manifest = root / "manifest.csv"
+    # No val split: the trainer then saves once, after the last epoch.
+    manifest.write_text(manifest.read_text().replace(",val,", ",train,"))
+    out = tmp_path / "head.pth"
+    monkeypatch.setattr(trainer, "DINOv2Encoder", _RandomStubEncoder)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["train_screening_classifier.py", "--data-root", str(root), "--epochs", "1",
+         "--batch-size", "4", "--image-size", "32", "--output", str(out),
+         "--allow-random-encoder"],
+    )
+
+    trainer.main()
+
+    ckpt = torch.load(out, map_location="cpu", weights_only=True)
+    assert ckpt["encoder_pretrained"] is False
+    with pytest.warns(RuntimeWarning, match="RANDOMLY INITIALISED DINOv2"):
+        load_screening_head(out, input_dim=8)

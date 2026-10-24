@@ -24,7 +24,9 @@ IMPORTANT CAVEATS (unchanged from LLaVA version):
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -52,8 +54,8 @@ REPORT_PROMPT_TEMPLATE = """You are an expert ophthalmologist analyzing an OCT s
 Given the following clinical data, generate a structured report:
 
 Patient Demographics: {demographics}
-vCDR: {vcdr:.3f}
-Risk Score: {risk_score:.3f}
+vCDR: {vcdr}
+Risk Score: {risk_score}
 RNFL Measurements: {rnfl_data}
 Progression Prediction: {progression}
 
@@ -67,6 +69,55 @@ Generate a clinical report with:
 
 Important: Flag any findings that require urgent attention.
 """
+
+NOT_AVAILABLE = "N/A"
+
+
+def _fmt_number(value: Any, spec: str) -> str:
+    """Format a float (or 0-d tensor) for the prompt; None/missing -> N/A."""
+    if value is None:
+        return NOT_AVAILABLE
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    try:
+        return format(float(value), spec)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_progression(prediction: dict | None) -> str:
+    """Describe a progression prediction in either shape the pipeline produces.
+
+    Accepts the flat dict SpecialistPipeline passes ({"probability", "class",
+    "uncertainty"}, any of them None) or the raw EvidentialForecaster output
+    ({"classification": {"prob": [B, K], "uncertainty": [B]}}).
+    """
+    if not prediction:
+        return "Not available"
+    prob = prediction.get("probability")
+    unc = prediction.get("uncertainty")
+    label = prediction.get("class")
+    cls = prediction.get("classification")
+    if prob is None and isinstance(cls, dict) and cls.get("prob") is not None:
+        prob = cls["prob"][0, 1]
+        unc = cls.get("uncertainty")
+        unc = unc[0] if unc is not None else None
+    if prob is None:
+        return "Not available"
+    text = f"Progression probability: {_fmt_number(prob, '.2f')}"
+    if label:
+        text += f" ({label})"
+    if unc is not None:
+        text += f" (uncertainty: {_fmt_number(unc, '.3f')})"
+    return text
+
+
+def _missing_vlm_backends(load_in_4bit: bool) -> list[str]:
+    """Optional [vlm] packages that from_pretrained needs but are not installed."""
+    needed = ["accelerate"]  # device_map="auto"
+    if load_in_4bit:
+        needed.append("bitsandbytes")  # BitsAndBytesConfig(load_in_4bit=True)
+    return [name for name in needed if importlib.util.find_spec(name) is None]
 
 
 class LlamaVisionReporter(nn.Module):
@@ -119,6 +170,23 @@ class LlamaVisionReporter(nn.Module):
                 "Install with: pip install -e '.[vlm]'"
             ) from e
 
+        # Check the optional backends up front: transformers reports a missing
+        # accelerate as a ValueError deep inside from_pretrained, which would
+        # otherwise surface as a misleading licence/login hint below.
+        missing = _missing_vlm_backends(self.load_in_4bit)
+        if missing:
+            hint = ""
+            if "bitsandbytes" in missing:
+                hint = (
+                    " bitsandbytes is only needed for 4-bit loading; the extra installs "
+                    "it where wheels exist (Linux, Windows, Apple Silicon macOS 14+). "
+                    "Elsewhere set vlm.load_in_4bit: false."
+                )
+            raise ImportError(
+                f"Cannot load {self.model_name}: missing {', '.join(missing)}. "
+                f"Install the VLM extras with: pip install -e '.[vlm]'.{hint}"
+            )
+
         quantization_config = None
         if self.load_in_4bit:
             try:
@@ -139,18 +207,23 @@ class LlamaVisionReporter(nn.Module):
             )
             processor = AutoProcessor.from_pretrained(self.model_name)
         except ImportError as e:
-            # Optional backends (accelerate for device_map, bitsandbytes for
-            # 4-bit) are only checked here; keep transformers' own message,
-            # which names the missing package and version.
+            # A backend that is installed but unusable (e.g. a bitsandbytes
+            # older than this transformers accepts); keep transformers' own
+            # message, which names the package and the version it needs.
             raise ImportError(
                 f"Cannot load {self.model_name}: {e} "
                 f"Install the VLM extras with: pip install -e '.[vlm]'"
             ) from e
-        except Exception as e:
+        except OSError as e:
+            # transformers reports gated, missing or unreachable weights as OSError.
             raise RuntimeError(
-                f"Failed to load {self.model_name}. "
+                f"Failed to load {self.model_name}: cannot fetch the weights. "
                 f"Ensure you have accepted the Llama license and logged in: "
                 f"huggingface-cli login. Error: {e}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load {self.model_name}: {type(e).__name__}: {e}"
             ) from e
         # Set both only once both loaded, so a failed load is retried in full.
         self._model, self._processor = model, processor
@@ -177,28 +250,8 @@ class LlamaVisionReporter(nn.Module):
         """
         self._ensure_loaded()
 
-        # Build structured prompt
-        demographics = clinical_context.get("demographics", "Not provided") if clinical_context else "Not provided"
-        vcdr = segmentation_results.get("vcdr", 0.0) if segmentation_results else 0.0
-        risk_score = clinical_context.get("risk_score", 0.0) if clinical_context else 0.0
-        rnfl_data = clinical_context.get("rnfl", "Not available") if clinical_context else "Not available"
-
-        progression = "Not available"
-        if progression_prediction:
-            cls = progression_prediction.get("classification", {})
-            prob = cls.get("prob", None)
-            if prob is not None:
-                progression = f"Progression probability: {prob[0, 1].item():.2f}"
-                unc = cls.get("uncertainty", None)
-                if unc is not None:
-                    progression += f" (uncertainty: {unc[0].item():.3f})"
-
-        prompt = REPORT_PROMPT_TEMPLATE.format(
-            demographics=demographics,
-            vcdr=vcdr,
-            risk_score=risk_score,
-            rnfl_data=rnfl_data,
-            progression=progression,
+        prompt = self.build_prompt(
+            segmentation_results, progression_prediction, clinical_context,
         )
 
         # Generate with Llama 3.2 Vision
@@ -218,6 +271,27 @@ class LlamaVisionReporter(nn.Module):
             raw_text=raw_text,
             requires_human_review=True,
             model_uncertainty=0.0,
+        )
+
+    @staticmethod
+    def build_prompt(
+        segmentation_results: dict | None = None,
+        progression_prediction: dict | None = None,
+        clinical_context: dict | None = None,
+    ) -> str:
+        """Fill REPORT_PROMPT_TEMPLATE; absent or None values become N/A.
+
+        Values are None whenever a modality was not run (e.g. no fundus image
+        -> no vCDR), so nothing here may assume a number.
+        """
+        seg = segmentation_results or {}
+        ctx = clinical_context or {}
+        return REPORT_PROMPT_TEMPLATE.format(
+            demographics=ctx.get("demographics") or "Not provided",
+            vcdr=_fmt_number(seg.get("vcdr"), ".3f"),
+            risk_score=_fmt_number(ctx.get("risk_score"), ".3f"),
+            rnfl_data=ctx.get("rnfl") or "Not available",
+            progression=_format_progression(progression_prediction),
         )
 
     def forward(self, x: torch.Tensor) -> str:

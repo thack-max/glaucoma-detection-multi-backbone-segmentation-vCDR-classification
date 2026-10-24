@@ -28,7 +28,11 @@ feature_extraction:
   variant: dinov2_vitb14  # AUC 0.958 for glaucoma (vs RETFound 0.940)
   embed_dim: 768  # DINOv2-Base output dim (vs RETFound 1024)
   freeze_encoder: true
-  use_registers: true  # Register tokens for cleaner GradCAM attention maps
+  # true selects the register-token backbone (torch.hub "<variant>_reg"; cleaner
+  # attention maps) whose features differ from the plain one's. The
+  # scripts/train_*.py trainers fit heads on the plain backbone, so keep false
+  # unless your checkpoints were trained on register features.
+  use_registers: false
   image_size: 224
 
 classifier:

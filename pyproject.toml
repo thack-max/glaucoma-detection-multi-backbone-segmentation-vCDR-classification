@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+# >=77 parses the PEP 639 `license = "MIT"` string below (older setuptools
+# fail metadata generation, e.g. with --no-build-isolation); bdist_wheel is
+# built into setuptools >=70.1, so no separate `wheel` requirement.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -40,9 +43,15 @@ dev = [
 ]
 vlm = [
     "peft>=0.7",
-    "bitsandbytes>=0.41",
-    # LlamaVisionReporter loads with device_map="auto"; transformers 5.x (allowed
-    # by the unpinned transformers>=4.45 above) treats accelerate<1.1.0 as absent.
+    # load_in_4bit (configs/tier/specialist.yaml) needs bitsandbytes; transformers
+    # 5.x (allowed by the unpinned transformers>=4.45 above) ignores <0.46.1.
+    # bitsandbytes>=0.46.1 publishes wheels only (no sdist) for manylinux,
+    # Windows and macOS 14+ arm64: skip it on Intel macOS so the rest of the
+    # extra still installs there (use vlm.load_in_4bit: false). Apple Silicon
+    # needs macOS 14+ to resolve it.
+    "bitsandbytes>=0.46.1; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    # LlamaVisionReporter loads with device_map="auto"; transformers 5.x
+    # treats accelerate<1.1.0 as absent.
     "accelerate>=1.1.0",
 ]
 

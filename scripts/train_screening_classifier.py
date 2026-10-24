@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from src.data.fundus_dataset import FundusDataset
 from src.data.transforms import get_fundus_transforms
 from src.models.classifier_head import ClassifierHead
-from src.models.features.dinov2_encoder import DINOv2Encoder
+from src.models.features.dinov2_encoder import DINOv2Encoder, require_pretrained
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output", type=str, default="checkpoints/screening_classifier.pth")
+    parser.add_argument(
+        "--allow-random-encoder", action="store_true",
+        help="Train even if DINOv2's pretrained weights cannot be downloaded (smoke runs "
+             "only: the features are random; the checkpoint records encoder_pretrained: false).",
+    )
     return parser.parse_args()
 
 
@@ -94,6 +99,7 @@ def main():
         freeze_encoder=True,
     ).to(device)
     encoder.eval()
+    encoder_pretrained = require_pretrained(encoder, args.allow_random_encoder)
 
     embed_dim = encoder.embed_dim
     classifier = ClassifierHead(input_dim=embed_dim).to(device)
@@ -129,14 +135,22 @@ def main():
             if val_acc > best_acc:
                 best_acc = val_acc
                 torch.save(
-                    {"classifier": classifier.state_dict(), "epoch": epoch, "val_acc": val_acc},
+                    {
+                        "classifier": classifier.state_dict(),
+                        "epoch": epoch,
+                        "val_acc": val_acc,
+                        "encoder_pretrained": encoder_pretrained,
+                    },
                     args.output,
                 )
 
         print(msg)
 
     if val_loader is None:
-        torch.save({"classifier": classifier.state_dict()}, args.output)
+        torch.save(
+            {"classifier": classifier.state_dict(), "encoder_pretrained": encoder_pretrained},
+            args.output,
+        )
     print(f"\nSaved to: {args.output}")
 
 

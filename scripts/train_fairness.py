@@ -45,7 +45,7 @@ from src.data.transforms import get_fundus_transforms
 from src.evaluation.fairness_audit import FairnessAuditor
 from src.models.classifier_head import ClassifierHead
 from src.models.fairness.equity_attention import EquityModule
-from src.models.features.dinov2_encoder import DINOv2Encoder
+from src.models.features.dinov2_encoder import DINOv2Encoder, require_pretrained
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=2,
                         help="Number of epochs to train the group predictor "
                              "without the GRL before adversarial training kicks in.")
+    parser.add_argument(
+        "--allow-random-encoder", action="store_true",
+        help="Train even if DINOv2's pretrained weights cannot be downloaded (smoke runs "
+             "only: the features are random; the checkpoint records encoder_pretrained: false).",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +180,7 @@ def main():
     # --- Models ---
     encoder = DINOv2Encoder(variant=args.dinov2_variant, freeze_encoder=True).to(device)
     encoder.eval()
+    encoder_pretrained = require_pretrained(encoder, args.allow_random_encoder)
     embed_dim = encoder.embed_dim
 
     equity = EquityModule(
@@ -246,6 +252,7 @@ def main():
                             "classifier": classifier.state_dict(),
                             "val_metrics": val_metrics,
                             "args": vars(args),
+                            "encoder_pretrained": encoder_pretrained,
                         },
                         output_dir / "best.pth",
                     )

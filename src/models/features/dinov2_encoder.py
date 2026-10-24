@@ -24,9 +24,50 @@ Limitation vs RETFound:
 
 from __future__ import annotations
 
+import http.client
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _is_download_error(exc: BaseException | None) -> bool:
+    """True for network / IO failures of torch.hub (offline, proxy, HTTP error).
+
+    torch.hub raises those as OSError (URLError, HTTPError, timeouts, ...) or
+    http.client errors; offline with no cached repo it raises a RuntimeError
+    chained from the URLError. Anything else is not a download problem.
+    """
+    while exc is not None:
+        if isinstance(exc, (OSError, http.client.HTTPException)):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def require_pretrained(encoder: nn.Module, allow_random: bool) -> bool:
+    """For trainers: stop unless the encoder's pretrained weights loaded.
+
+    A head fitted on a randomly initialised encoder's features is meaningless
+    (and would later load without complaint), so training on one requires an
+    explicit opt-in. Returns ``encoder.pretrained_loaded``, to be saved in the
+    checkpoint as ``"encoder_pretrained"``.
+
+    Raises:
+        SystemExit: pretrained weights did not load and ``allow_random`` is False.
+    """
+    pretrained = bool(getattr(encoder, "pretrained_loaded", True))
+    if not pretrained and not allow_random:
+        raise SystemExit(
+            f"DINOv2 {getattr(encoder, 'variant', '')}: pretrained weights could not be "
+            f"downloaded/loaded via torch.hub (see the RuntimeWarning above), so its "
+            f"features are random and a model trained on them is meaningless. Fix "
+            f"network/proxy access to GitHub and dl.fbaipublicfiles.com (or pre-populate "
+            f"the torch.hub cache), or pass --allow-random-encoder for a smoke run (the "
+            f"checkpoint then records encoder_pretrained: false)."
+        )
+    return pretrained
 
 
 class DINOv2Encoder(nn.Module):
@@ -56,26 +97,48 @@ class DINOv2Encoder(nn.Module):
                      best accuracy/efficiency balance (AUC 0.958 for glaucoma).
             freeze_encoder: Whether to freeze all encoder weights.
                            Recommended True for feature extraction.
-            use_registers: Use register-token variant (*_reg4) for cleaner
-                          attention maps, useful for GradCAM explainability.
+            use_registers: Use the register-token variant (torch.hub
+                          "<variant>_reg") for cleaner attention maps, useful
+                          for GradCAM explainability. Its features differ from
+                          the plain variant's: heads must be trained on the
+                          same choice (the scripts/train_*.py trainers use the
+                          plain variant).
         """
         super().__init__()
-        self.variant = variant
-        model_name = f"{variant}_reg4" if use_registers else variant
-
         if variant not in self.VARIANTS:
             raise ValueError(f"Unknown variant '{variant}'. Choose from: {list(self.VARIANTS.keys())}")
 
+        self.variant = variant
+        # Callable names facebookresearch/dinov2's hubconf.py exports
+        # ("_reg4" is timm's naming, not the hub's).
+        model_name = f"{variant}_reg" if use_registers else variant
         self.embed_dim = self.VARIANTS[variant]["embed_dim"]
 
-        # Load from torch.hub (downloads automatically on first use)
+        # Load from torch.hub (downloads automatically on first use).
+        # pretrained_loaded tells callers whether the features mean anything.
+        self.pretrained_loaded = False
         try:
             self.encoder = torch.hub.load(
                 "facebookresearch/dinov2", model_name, pretrained=True,
             )
-        except Exception:
-            # Fallback: create architecture without pretrained weights
-            # (for testing / environments without internet)
+            self.pretrained_loaded = True
+        except Exception as exc:  # noqa: BLE001
+            if not _is_download_error(exc):
+                # A configuration or code error (e.g. a callable the hub does
+                # not export): never disguise it as an offline fallback.
+                raise
+            # Fallback: the architecture without pretrained weights, so tests
+            # and offline smoke runs still work. Its features are random:
+            # say so loudly instead of silently producing predictions.
+            warnings.warn(
+                f"DINOv2Encoder: could not download/load pretrained '{model_name}' "
+                f"via torch.hub ({type(exc).__name__}: {exc}); falling back to a "
+                f"RANDOMLY INITIALISED {variant}. Its features are meaningless "
+                f"(fine for tests and offline smoke runs, not for predictions). "
+                f"Check pretrained_loaded before trusting outputs.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             self.encoder = self._build_fallback(variant)
 
         if freeze_encoder:

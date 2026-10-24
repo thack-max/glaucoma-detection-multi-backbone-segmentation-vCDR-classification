@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader
 
 from src.data.multimodal_dataset import MultimodalGlaucomaDataset
 from src.data.transforms import get_fundus_transforms
-from src.models.features.dinov2_encoder import DINOv2Encoder
+from src.models.features.dinov2_encoder import DINOv2Encoder, require_pretrained
 from src.models.progression.delta_t_mamba import DeltaTMamba
 from src.models.progression.evidential_forecaster import (
     EvidentialForecaster,
@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=2)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output-dir", type=str, default="checkpoints/progression")
+    parser.add_argument(
+        "--allow-random-encoder", action="store_true",
+        help="Train even if DINOv2's pretrained weights cannot be downloaded (smoke runs "
+             "only: the features are random; the checkpoint records encoder_pretrained: false).",
+    )
     return parser.parse_args()
 
 
@@ -128,6 +133,7 @@ def main():
     # --- Models ---
     encoder = DINOv2Encoder(variant=args.dinov2_variant, freeze_encoder=True).to(device)
     encoder.eval()
+    encoder_pretrained = require_pretrained(encoder, args.allow_random_encoder)
 
     mamba = DeltaTMamba(
         input_dim=encoder.embed_dim,
@@ -186,6 +192,7 @@ def main():
                     "mamba": mamba.state_dict(),
                     "forecaster": forecaster.state_dict(),
                     "args": vars(args),
+                    "encoder_pretrained": encoder_pretrained,
                 },
                 output_dir / "best.pth",
             )

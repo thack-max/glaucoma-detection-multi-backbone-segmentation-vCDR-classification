@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import urllib.error
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -60,6 +62,22 @@ class _BinaryHead(nn.Module):
 
 
 class TestDINOv2GradCAM:
+    def test_restores_every_submodule_mode(self):
+        # A wrapper built on the fly (nn.Sequential starts in train mode)
+        # around eval-mode inference modules: explaining must not leave the
+        # wrapped modules in train mode (dropout on for the next prediction).
+        torch.manual_seed(0)
+        encoder = _StubEncoder(embed_dim=16).eval()
+        inner = nn.Sequential(nn.Dropout(0.5), _BinaryHead(16)).eval()
+        wrapper = nn.Sequential(nn.Identity(), inner)
+        assert wrapper.training and not inner.training
+
+        DINOv2GradCAM(encoder, wrapper)(torch.randn(1, 3, 32, 32))
+
+        assert wrapper.training  # its own flag is restored too
+        assert not [name for name, m in inner.named_modules() if m.training]
+        assert not encoder.training
+
     def test_output_shape(self):
         torch.manual_seed(0)
         encoder = _StubEncoder(embed_dim=16, num_patches=49)
@@ -113,7 +131,7 @@ class TestDINOv2GradCAM:
         from src.models.features.dinov2_encoder import DINOv2Encoder
 
         def _offline(*args, **kwargs):
-            raise RuntimeError("offline test: use the random-init fallback")
+            raise urllib.error.URLError("offline test: use the random-init fallback")
 
         monkeypatch.setattr(torch.hub, "load", _offline)
         torch.manual_seed(0)

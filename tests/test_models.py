@@ -4,6 +4,8 @@ Tests verify model construction, forward pass shapes, and basic functionality
 WITHOUT requiring pretrained weights or GPU.
 """
 
+import re
+
 import torch
 import pytest
 
@@ -91,6 +93,100 @@ class TestDINOv2Encoder:
         assert "dinov2_vits14" in DINOv2Encoder.VARIANTS
         assert "dinov2_vitb14" in DINOv2Encoder.VARIANTS
         assert DINOv2Encoder.VARIANTS["dinov2_vitb14"]["embed_dim"] == 768
+
+    def test_hub_failure_warns_and_flags_random_fallback(self, monkeypatch):
+        """The random-init fallback must never be silent: callers (the CLIs)
+        need to know the features carry no pretrained knowledge."""
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        def _offline(*args, **kwargs):
+            raise OSError("torch.hub unreachable")
+
+        monkeypatch.setattr(torch.hub, "load", _offline)
+        with pytest.warns(RuntimeWarning, match="RANDOMLY INITIALISED") as record:
+            encoder = DINOv2Encoder(variant="dinov2_vits14")
+        assert "torch.hub unreachable" in str(record[0].message)
+        assert encoder.pretrained_loaded is False
+        assert encoder(torch.randn(1, 3, 32, 32)).shape == (1, 384)  # still usable
+
+    def test_hub_success_flags_pretrained(self, monkeypatch, recwarn):
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        class _Hub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(3, 384)
+
+            def forward(self, x):
+                return self.proj(x.mean(dim=(-2, -1)))
+
+        monkeypatch.setattr(torch.hub, "load", lambda *a, **k: _Hub())
+        encoder = DINOv2Encoder(variant="dinov2_vits14")
+        assert encoder.pretrained_loaded is True
+        assert not [w for w in recwarn if "RANDOMLY" in str(w.message)]
+
+    # Backbone callables facebookresearch/dinov2's hubconf.py exports
+    # (https://github.com/facebookresearch/dinov2/blob/main/hubconf.py): the
+    # register-token variants are "<variant>_reg"; "_reg4" is timm's naming.
+    HUB_BACKBONES = {f"dinov2_vit{size}14{suffix}" for size in "sblg" for suffix in ("", "_reg")}
+
+    @pytest.mark.parametrize("use_registers", [False, True])
+    @pytest.mark.parametrize(
+        "variant", ["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"],
+    )
+    def test_requests_a_callable_the_hub_exports(self, monkeypatch, variant, use_registers):
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        requested = []
+
+        def _hub(repo, model, **kwargs):
+            requested.append((repo, model))
+            return torch.nn.Linear(3, 8)
+
+        monkeypatch.setattr(torch.hub, "load", _hub)
+        encoder = DINOv2Encoder(variant=variant, use_registers=use_registers)
+        assert encoder.pretrained_loaded is True
+        assert requested == [
+            ("facebookresearch/dinov2", f"{variant}_reg" if use_registers else variant),
+        ]
+        assert requested[0][1] in self.HUB_BACKBONES
+
+    def test_offline_without_hub_cache_falls_back(self, monkeypatch, tmp_path):
+        # Real torch.hub code path with no network: it raises a RuntimeError
+        # chained from the URLError ("no internet connection and the repo
+        # could not be found in the cache"); that is an offline run.
+        import urllib.error
+
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        def _no_network(*args, **kwargs):
+            raise urllib.error.URLError("no network")
+
+        monkeypatch.setattr(torch.hub, "urlopen", _no_network)
+        monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path))
+        with pytest.warns(RuntimeWarning, match="RANDOMLY INITIALISED"):
+            encoder = DINOv2Encoder(variant="dinov2_vits14")
+        assert encoder.pretrained_loaded is False
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("Cannot find callable dinov2_vits14_reg4 in hubconf"),
+            TypeError("dinov2_vits14() got an unexpected keyword argument 'x'"),
+        ],
+        ids=["unknown-callable", "bad-kwargs"],
+    )
+    def test_hub_configuration_errors_are_not_masked_as_offline(self, monkeypatch, error):
+        # Only network / IO failures may fall back to random weights; a
+        # configuration error must surface instead of a misleading "offline".
+        from src.models.features.dinov2_encoder import DINOv2Encoder
+
+        def _raise(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(torch.hub, "load", _raise)
+        with pytest.raises(type(error), match=re.escape(str(error))):
+            DINOv2Encoder(variant="dinov2_vits14")
 
     def test_forward_handles_arbitrary_input_sizes(self):
         """DINOv2's timm-backed VIT strictly checks input size; the encoder

@@ -6,6 +6,8 @@ DINOv2 is replaced by a small deterministic stub so these tests stay offline.
 from __future__ import annotations
 
 import copy
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pickle
@@ -373,20 +375,52 @@ def test_vlm_reporter_not_built_unless_enabled(monkeypatch, tmp_path):
     assert record["clinical_report"] is None
 
 
-def _fail_mllama_load_on_missing_backend(monkeypatch):
-    """Make the real LlamaVisionReporter fail the way transformers does without bitsandbytes."""
+def _fake_installed(monkeypatch, *, present=(), absent=()):
+    """Make the reporter's backend check see packages as (not) installed.
+
+    Scoped to the reporter module: transformers' own availability checks also
+    use find_spec and then import the package, so a global fake breaks them.
+    """
+    import src.models.vlm.llama_vision_reporter as vlm_module
+
+    real_find_spec = importlib.util.find_spec
+
+    def _find_spec(name, *args, **kwargs):
+        if name in absent:
+            return None
+        if name in present:
+            return importlib.machinery.ModuleSpec(name, None)
+        return real_find_spec(name, *args, **kwargs)
+
+    fake = SimpleNamespace(util=SimpleNamespace(find_spec=_find_spec))
+    # raising=False: the module only imports importlib once it pre-checks.
+    monkeypatch.setattr(vlm_module, "importlib", fake, raising=False)
+
+
+def _patch_mllama_from_pretrained(monkeypatch, exc: Exception):
     # Patch the class itself: transformers swaps the `transformers` module
     # object in sys.modules on lazy import, so patching that attribute is flaky.
     from transformers.models.mllama.modeling_mllama import MllamaForConditionalGeneration
 
     def _from_pretrained(cls, *args, **kwargs):
-        raise ImportError(
-            "Using `bitsandbytes` 4-bit quantization requires bitsandbytes: "
-            "`pip install -U bitsandbytes>=0.46.1`"
-        )
+        raise exc
 
     monkeypatch.setattr(
         MllamaForConditionalGeneration, "from_pretrained", classmethod(_from_pretrained),
+    )
+
+
+def _fail_mllama_load_on_missing_backend(monkeypatch):
+    """Make the real LlamaVisionReporter fail the way transformers does with an unusable bitsandbytes."""
+    # Installed (so the up-front check passes) but rejected by transformers,
+    # e.g. bitsandbytes older than the 0.46.1 transformers 5.x requires.
+    _fake_installed(monkeypatch, present=("accelerate", "bitsandbytes"))
+    _patch_mllama_from_pretrained(
+        monkeypatch,
+        ImportError(
+            "Using `bitsandbytes` 4-bit quantization requires bitsandbytes: "
+            "`pip install -U bitsandbytes>=0.46.1`"
+        ),
     )
 
 
@@ -414,3 +448,296 @@ def test_enable_vlm_load_failure_keeps_assessment(monkeypatch, tmp_path, capsys)
     assert record["progression_probability"] is not None
     assert record["clinical_report"] is None
     assert "VLM report: not generated" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("load_in_4bit", "absent", "expected"),
+    [
+        (False, ("accelerate",), "accelerate"),
+        (True, ("accelerate", "bitsandbytes"), "accelerate, bitsandbytes"),
+        (True, ("bitsandbytes",), "bitsandbytes"),
+    ],
+)
+def test_reporter_missing_backend_points_to_vlm_extra(monkeypatch, load_in_4bit, absent, expected):
+    # transformers reports a missing accelerate as a ValueError from inside
+    # from_pretrained; that must not become a licence/login hint.
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+
+    _fake_installed(
+        monkeypatch, absent=absent,
+        present=tuple({"accelerate", "bitsandbytes"} - set(absent)),
+    )
+    _patch_mllama_from_pretrained(
+        monkeypatch,
+        ValueError(
+            "Using a `device_map`, `tp_plan`, `torch.device` context manager or setting "
+            "`torch.set_default_device(device)` requires `accelerate`. You can install it "
+            "with `pip install accelerate`"
+        ),
+    )
+    reporter = LlamaVisionReporter(model_name="test/tiny-vlm", load_in_4bit=load_in_4bit)
+    with pytest.raises(ImportError, match=r"missing " + expected + r"\..*\[vlm\]") as excinfo:
+        reporter.generate_report()
+    assert "licen" not in str(excinfo.value).lower()
+
+
+def test_reporter_missing_bitsandbytes_offers_full_precision(monkeypatch):
+    # The [vlm] extra installs bitsandbytes only where wheels exist (not on
+    # Intel macOS), so the hint must also name the load_in_4bit: false route.
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+
+    _fake_installed(monkeypatch, absent=("bitsandbytes",), present=("accelerate",))
+    _patch_mllama_from_pretrained(monkeypatch, AssertionError("must not be reached"))
+    reporter = LlamaVisionReporter(model_name="test/tiny-vlm", load_in_4bit=True)
+    with pytest.raises(ImportError, match=r"load_in_4bit: false"):
+        reporter.generate_report()
+
+
+def test_reporter_licence_hint_only_for_hub_errors(monkeypatch):
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+
+    _fake_installed(monkeypatch, present=("accelerate", "bitsandbytes"))
+    reporter = LlamaVisionReporter(model_name="test/tiny-vlm", load_in_4bit=False)
+
+    _patch_mllama_from_pretrained(monkeypatch, OSError("You are trying to access a gated repo."))
+    with pytest.raises(RuntimeError, match="license"):
+        reporter.generate_report()
+
+    _patch_mllama_from_pretrained(monkeypatch, ValueError("unsupported dtype"))
+    with pytest.raises(RuntimeError, match="unsupported dtype") as excinfo:
+        reporter.generate_report()
+    assert "license" not in str(excinfo.value)
+
+
+class _FakeProcessor:
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def __call__(self, text, return_tensors):
+        self.prompts.append(text)
+        return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "REPORT TEXT"
+
+
+class _FakeModel:
+    device = torch.device("cpu")
+
+    def generate(self, **kwargs):
+        return torch.tensor([[1, 2, 3, 4]])
+
+
+def _loaded_reporter():
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+
+    reporter = LlamaVisionReporter(model_name="test/tiny-vlm", load_in_4bit=False)
+    reporter._model, reporter._processor = _FakeModel(), _FakeProcessor()
+    return reporter
+
+
+def test_reporter_prompt_handles_missing_values():
+    # vCDR is None whenever there is no fundus image; nothing may assume a number.
+    reporter = _loaded_reporter()
+    report = reporter.generate_report(
+        segmentation_results={"disc_mask": None, "cup_mask": None, "vcdr": None},
+        progression_prediction={"probability": None, "class": None, "uncertainty": None},
+        clinical_context={"iop": 21.0, "risk_score": None},
+    )
+    assert report.raw_text == "REPORT TEXT"
+    prompt = reporter._processor.prompts[-1]
+    assert "vCDR: N/A" in prompt
+    assert "Risk Score: N/A" in prompt
+    assert "Progression Prediction: Not available" in prompt
+
+
+def test_reporter_prompt_includes_pipeline_progression():
+    # SpecialistPipeline passes {"probability", "class", "uncertainty"}.
+    reporter = _loaded_reporter()
+    reporter.generate_report(
+        segmentation_results={"vcdr": 0.61234},
+        progression_prediction={"probability": 0.42, "class": "slow", "uncertainty": 0.1},
+        clinical_context={"risk_score": 0.7},
+    )
+    prompt = reporter._processor.prompts[-1]
+    assert "vCDR: 0.612" in prompt
+    assert "Risk Score: 0.700" in prompt
+    assert "Progression probability: 0.42 (slow) (uncertainty: 0.100)" in prompt
+
+
+def test_enable_vlm_reports_for_patient_without_fundus(monkeypatch, tmp_path):
+    # The patient has visits/ + clinical.json but no fundus.png, so vcdr is None.
+    from src.models.vlm.llama_vision_reporter import LlamaVisionReporter
+
+    processor = _FakeProcessor()
+
+    def _fake_load(self):
+        self._model, self._processor = _FakeModel(), processor
+
+    monkeypatch.setattr(LlamaVisionReporter, "_ensure_loaded", _fake_load)
+    patient = _make_patient(tmp_path, clinical=True)
+    assert not (patient / "fundus.png").exists()
+
+    record = _run_cli(
+        monkeypatch, tmp_path, _write_config(tmp_path, TINY_CONFIG), patient,
+        "--enable-vlm", embed_dim=16,
+    )
+    assert record["vcdr"] is None
+    assert record["clinical_report"] == "REPORT TEXT"
+    assert "vCDR: N/A" in processor.prompts[-1]
+
+
+class _BuggyReporter:
+    def generate_report(self, **kwargs):
+        raise TypeError("unsupported format string passed to NoneType.__format__")
+
+
+class _UnloadableReporter:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+
+    def generate_report(self, **kwargs):
+        raise self.exc
+
+
+def test_vlm_programming_error_propagates():
+    pipeline = SpecialistPipeline(report_generator=_BuggyReporter(), device="cpu", enable_vlm=True)
+    with pytest.raises(TypeError, match="NoneType"):
+        pipeline.run(clinical_data={"iop": 20.0})
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ImportError("no accelerate"), OSError("gated repo"), RuntimeError("Failed to load")],
+    ids=["ImportError", "OSError", "RuntimeError"],
+)
+def test_vlm_load_failure_degrades_to_warning(exc):
+    pipeline = SpecialistPipeline(
+        report_generator=_UnloadableReporter(exc), device="cpu", enable_vlm=True,
+    )
+    with pytest.warns(RuntimeWarning, match="VLM report not generated"):
+        output = pipeline.run(clinical_data={"iop": 20.0})
+    assert output.clinical_report is None
+
+
+# ---------------------------------------------------------------------------
+# Zero-filled forecaster inputs must be reported
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("clinical", "vf", "imputed"),
+    [
+        (False, False, ["clinical", "vf"]),
+        (True, False, ["vf"]),
+        (False, True, ["clinical"]),
+        (True, True, []),
+    ],
+    ids=["none", "clinical-only", "vf-only", "both"],
+)
+def test_zero_filled_forecaster_inputs_are_reported(
+    monkeypatch, tmp_path, recwarn, clinical, vf, imputed,
+):
+    config = copy.deepcopy(TINY_CONFIG)
+    # VFGraphNet readout is 2 * output_dim (= 16 in TINY_CONFIG).
+    config["progression"]["forecaster"].update(clinical_dim=3, vf_dim=16)
+    patient = _make_patient(tmp_path, clinical=clinical, vf=vf)
+
+    record = _run_cli(
+        monkeypatch, tmp_path, _write_config(tmp_path, config), patient, embed_dim=16,
+    )
+
+    assert record["progression_probability"] is not None
+    assert record["imputed_modalities"] == imputed
+    zero_fill_warnings = [w for w in recwarn if "zero-filled" in str(w.message)]
+    if imputed:
+        assert len(zero_fill_warnings) == 1
+        assert issubclass(zero_fill_warnings[0].category, RuntimeWarning)
+        for name in imputed:
+            assert name in str(zero_fill_warnings[0].message)
+    else:
+        assert not zero_fill_warnings
+
+
+def test_forecaster_without_aux_slots_imputes_nothing(monkeypatch, tmp_path):
+    # Slots the forecaster was not built with are not "missing".
+    config = copy.deepcopy(TINY_CONFIG)
+    config["progression"]["forecaster"].update(clinical_dim=0, vf_dim=0)
+    patient = _make_patient(tmp_path)
+    record = _run_cli(
+        monkeypatch, tmp_path, _write_config(tmp_path, config), patient, embed_dim=16,
+    )
+    assert record["imputed_modalities"] == []
+
+
+@pytest.mark.parametrize(
+    ("clinical_json", "imputed"),
+    [
+        ({}, ["clinical.iop", "clinical.age", "clinical.sex"]),
+        ({"age": 70}, ["clinical.iop", "clinical.sex"]),
+        # Keys are lower-case: "IOP" is not read, so all three are zero-filled.
+        ({"IOP": 22}, ["clinical.iop", "clinical.age", "clinical.sex"]),
+        ({"iop": None, "age": 70, "sex": 1}, ["clinical.iop"]),
+        ({"iop": 28.0, "age": 70, "sex": 1}, []),
+    ],
+    ids=["empty", "age-only", "wrong-case", "null-iop", "complete"],
+)
+def test_zero_filled_clinical_fields_are_reported(
+    monkeypatch, tmp_path, recwarn, clinical_json, imputed,
+):
+    # A clinical.json that exists but lacks a field zero-fills that field just
+    # like a missing file zero-fills all three: it must be reported too.
+    config = copy.deepcopy(TINY_CONFIG)  # forecaster clinical_dim=3, vf_dim=0
+    patient = _make_patient(tmp_path)
+    with open(patient / "clinical.json", "w") as f:
+        json.dump(clinical_json, f)
+
+    record = _run_cli(
+        monkeypatch, tmp_path, _write_config(tmp_path, config), patient, embed_dim=16,
+    )
+
+    assert record["progression_probability"] is not None
+    assert record["imputed_modalities"] == imputed
+    zero_fill_warnings = [w for w in recwarn if "zero-filled" in str(w.message)]
+    if imputed:
+        assert len(zero_fill_warnings) == 1
+        for name in imputed:
+            assert name in str(zero_fill_warnings[0].message)
+    else:
+        assert not zero_fill_warnings
+
+
+def test_zero_filled_clinical_fields_fed_to_fusion_are_reported(monkeypatch, tmp_path):
+    # Without a forecaster clinical slot, the fusion module still consumes the
+    # clinical vector, so its zero-filled fields are reported as well.
+    config = copy.deepcopy(TINY_CONFIG)
+    config["progression"]["forecaster"].update(clinical_dim=0)
+    patient = _make_patient(tmp_path)
+    with open(patient / "clinical.json", "w") as f:
+        json.dump({"age": 70}, f)
+
+    record = _run_cli(
+        monkeypatch, tmp_path, _write_config(tmp_path, config), patient, embed_dim=16,
+    )
+    assert record["imputed_modalities"] == ["clinical.iop", "clinical.sex"]
+
+
+def test_non_numeric_clinical_field_names_the_field():
+    pipeline = SpecialistPipeline(device="cpu")
+    with pytest.raises(ValueError, match="clinical.sex"):
+        pipeline._clinical_vector({"iop": 20.0, "age": 61, "sex": "female"})
+
+
+def test_checkpoint_trained_on_random_encoder_warns(tmp_path, capsys):
+    # A --allow-random-encoder smoke checkpoint loads, but must say so.
+    from src.models.progression.evidential_forecaster import EvidentialForecaster
+
+    forecaster = EvidentialForecaster(temporal_dim=8, clinical_dim=3, hidden_dim=8)
+    path = tmp_path / "best.pth"
+    torch.save({"forecaster": forecaster.state_dict(), "encoder_pretrained": False}, path)
+    run_specialist._load_weights(forecaster, str(path), ["forecaster"], "forecaster")
+    assert "RANDOMLY INITIALISED DINOv2" in capsys.readouterr().err
+
+    torch.save({"forecaster": forecaster.state_dict(), "encoder_pretrained": True}, path)
+    run_specialist._load_weights(forecaster, str(path), ["forecaster"], "forecaster")
+    assert "RANDOMLY" not in capsys.readouterr().err
