@@ -218,6 +218,34 @@ class TestEvidentialForecaster:
             out = model(temporal, clinical, vf)
         assert out["classification"]["prob"].shape == (2, 2)
 
+    def test_missing_optional_inputs_are_zero_filled(self):
+        """A configured clinical/VF slot without data must not change the input width."""
+        from src.models.progression.evidential_forecaster import EvidentialForecaster
+        model = EvidentialForecaster(temporal_dim=16, clinical_dim=3, vf_dim=8, hidden_dim=16)
+        model.eval()
+        temporal = torch.randn(2, 16)
+        clinical = torch.randn(2, 3)
+        with torch.no_grad():
+            out = model(temporal)
+            explicit = model(temporal, torch.zeros(2, 3), torch.zeros(2, 8))
+            clinical_only = model(temporal, clinical_features=clinical)
+            clinical_explicit = model(temporal, clinical, torch.zeros(2, 8))
+        torch.testing.assert_close(out["classification"]["prob"], explicit["classification"]["prob"])
+        torch.testing.assert_close(
+            clinical_only["classification"]["prob"], clinical_explicit["classification"]["prob"],
+        )
+
+    def test_rejects_mis_sized_or_unconfigured_inputs(self):
+        from src.models.progression.evidential_forecaster import EvidentialForecaster
+        model = EvidentialForecaster(temporal_dim=16, clinical_dim=3, hidden_dim=16)
+        temporal = torch.randn(1, 16)
+        with pytest.raises(ValueError, match="clinical"):
+            model(temporal, clinical_features=torch.randn(1, 5))
+        with pytest.raises(ValueError, match="vf"):
+            model(temporal, vf_features=torch.randn(1, 2))  # vf_dim=0
+        with pytest.raises(ValueError, match="temporal"):
+            model(torch.randn(1, 12))
+
     def test_evidential_loss(self):
         from src.models.progression.evidential_forecaster import (
             EvidentialForecaster,

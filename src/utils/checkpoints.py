@@ -71,6 +71,7 @@ def save_checkpoint(
 def load_checkpoint(
     path: str | Path,
     map_location: str | torch.device = "cpu",
+    weights_only: bool = True,
 ) -> dict[str, Any]:
     """Load a checkpoint and return a normalized dict.
 
@@ -78,6 +79,14 @@ def load_checkpoint(
       1. New format: {"format_version": "...", "state_dicts": {...}, ...}
       2. Legacy dict-of-state-dicts: {"model": sd, "classifier": sd, ...}
       3. Raw state_dict (OrderedDict of tensors).
+
+    Args:
+        path: Checkpoint file.
+        map_location: Passed to torch.load.
+        weights_only: Passed to torch.load. Keep the default (True) for any
+            file you did not write yourself: with False, unpickling can run
+            arbitrary code. Every layout the training scripts write (state
+            dicts plus plain-Python metadata) loads with True.
 
     Returns:
         {
@@ -91,7 +100,7 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    raw = torch.load(path, map_location=map_location, weights_only=False)
+    raw = torch.load(path, map_location=map_location, weights_only=weights_only)
 
     # Case 1: new canonical format
     if isinstance(raw, dict) and raw.get("format_version", "").startswith("glaucomamba-ckpt"):

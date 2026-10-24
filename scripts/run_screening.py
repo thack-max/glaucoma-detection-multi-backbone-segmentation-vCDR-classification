@@ -23,12 +23,24 @@ import yaml
 
 from src.data.transforms import get_fundus_transforms
 from src.data.fundus_dataset import _read_image
+from src.models.classifier_head import load_classifier_head
 from src.models.explainability.gradcam import (
     AttentionRolloutCAM,
     DINOv2GradCAM,
     overlay_heatmap_on_image,
 )
 from src.pipeline.screening import ScreeningPipeline
+
+# The copy shipped with the package (configs/ ships beside scripts/), so the
+# installed `glaucoma-screen` command works from any directory.
+PACKAGED_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "tier" / "screening.yaml"
+# The original cwd-relative default: a project directory's own edited copy.
+LOCAL_CONFIG = Path("configs") / "tier" / "screening.yaml"
+
+
+def default_config() -> Path:
+    """Default --config: ./configs/tier/screening.yaml if present, else the packaged copy."""
+    return LOCAL_CONFIG if LOCAL_CONFIG.is_file() else PACKAGED_CONFIG
 
 
 def _try_load_segmenter(cfg: dict, device: str):
@@ -68,17 +80,10 @@ def _try_load_encoder(cfg: dict, device: str):
 
 
 def _try_load_classifier(cfg: dict, device: str):
-    import torch.nn as nn
-
-    head = nn.Sequential(
-        nn.LayerNorm(cfg.get("input_dim", 768)),
-        nn.Dropout(0.3),
-        nn.Linear(cfg.get("input_dim", 768), 1),
-    )
+    # Same head class train_screening_classifier.py saves; loaded strictly.
     ckpt = cfg.get("checkpoint")
-    if ckpt and Path(ckpt).exists():
-        state = torch.load(ckpt, map_location="cpu")
-        head.load_state_dict(state.get("classifier", state), strict=False)
+    head = load_classifier_head(ckpt, cfg.get("input_dim", 768))
+    if ckpt:
         print(f"Loaded classifier head: {ckpt}")
     head.eval()
     return head.to(device)
@@ -174,7 +179,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tier 1: Glaucoma Screening")
     parser.add_argument("--image", type=str, help="Path to a single fundus image")
     parser.add_argument("--image-dir", type=str, help="Directory of fundus images")
-    parser.add_argument("--config", type=str, default="configs/tier/screening.yaml")
+    parser.add_argument("--config", type=str, default=str(default_config()))
     parser.add_argument("--baseline", action="store_true", help="Use vCDR > 0.5 baseline mode")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -184,6 +189,8 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    # Always say which file was used: the default depends on the cwd.
+    print(f"Config: {Path(args.config).resolve()}")
     with open(args.config) as f:
         config = yaml.safe_load(f)
 

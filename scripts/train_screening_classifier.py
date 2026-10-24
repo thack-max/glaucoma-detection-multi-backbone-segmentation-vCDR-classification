@@ -21,22 +21,8 @@ from torch.utils.data import DataLoader
 
 from src.data.fundus_dataset import FundusDataset
 from src.data.transforms import get_fundus_transforms
+from src.models.classifier_head import ClassifierHead
 from src.models.features.dinov2_encoder import DINOv2Encoder
-
-
-class ClassifierHead(nn.Module):
-    """Simple linear classifier on top of frozen DINOv2 embeddings."""
-
-    def __init__(self, input_dim: int = 768, dropout: float = 0.3) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
 
 
 def parse_args() -> argparse.Namespace:

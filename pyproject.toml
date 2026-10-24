@@ -34,10 +34,16 @@ dev = [
     "pre-commit>=3.5",
     "jupyter>=1.0",
     "ipykernel>=6.25",
+    # tests/test_entry_points.py builds a wheel (Python 3.12+ venvs ship no
+    # setuptools); >=77 reads the PEP 639 `license = "MIT"` string above.
+    "setuptools>=77",
 ]
 vlm = [
     "peft>=0.7",
     "bitsandbytes>=0.41",
+    # LlamaVisionReporter loads with device_map="auto"; transformers 5.x (allowed
+    # by the unpinned transformers>=4.45 above) treats accelerate<1.1.0 as absent.
+    "accelerate>=1.1.0",
 ]
 
 [project.scripts]
@@ -47,7 +53,13 @@ glaucoma-specialist = "scripts.run_specialist:main"
 [tool.setuptools.packages.find]
 where = ["."]
 # `scripts` must ship too: the [project.scripts] entry points import from it.
-include = ["src*", "scripts*"]
+# `configs` ships (as data-only namespace packages) so the console scripts'
+# default --config, resolved relative to scripts/, also exists when installed.
+include = ["src*", "scripts*", "configs*"]
+
+[tool.setuptools.package-data]
+"configs.tier" = ["*.yaml"]
+"configs.model" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 100

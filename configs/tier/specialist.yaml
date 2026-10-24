@@ -40,7 +40,7 @@ visual_field:
   num_gin_layers: 4
   output_dim: 128
   # AUC 0.982 for VF defect detection (vs Anderson criteria 0.906)
-  checkpoint: null
+  checkpoint: null  # scripts/train_specialist.py best.pth ("vf_net")
 
 progression:
   temporal_encoder:
@@ -51,14 +51,20 @@ progression:
     num_layers: 4
     expand: 2
     dropout: 0.2
+    # scripts/train_progression.py ("mamba") or train_specialist.py ("temporal") best.pth
+    checkpoint: null
   forecaster:
     model: evidential  # Calibrated uncertainty per prediction
     temporal_dim: 512
-    clinical_dim: 32
-    vf_dim: 256  # VFGraphNet readout_dim
+    clinical_dim: 3  # [iop, age, sex], as built by SpecialistPipeline
+    vf_dim: 256  # VFGraphNet readout_dim (2 * visual_field.output_dim); 0 = no VF input
     hidden_dim: 256
     dropout: 0.3
     num_classes: 2  # stable vs progressing
+    # best.pth ("forecaster"). Its input dims must match the three above:
+    # scripts/train_progression.py trains temporal_dim=512, clinical_dim=3, vf_dim=0;
+    # train_specialist.py's forecaster takes [temporal | fused] and does not fit.
+    checkpoint: null
   observation_window: 4  # visits
   # RNFL is essential (removing: AUC 0.569). VF is redundant (removing: AUC 0.975).
   primary_modality: rnfl_oct
@@ -69,11 +75,12 @@ fusion:
     fundus: 768    # DINOv2 fundus embedding
     oct: 768       # DINOv2 OCT embedding
     vf: 256        # VFGraphNet readout
-    clinical: 32   # Clinical features (IOP, age, etc.)
+    clinical: 3    # Clinical features [iop, age, sex]
   fused_dim: 512
   num_heads: 4
   dropout: 0.2
   mc_samples: 10  # Monte Carlo dropout iterations for uncertainty
+  checkpoint: null  # scripts/train_specialist.py best.pth ("fusion")
 
 vlm:
   model: meta-llama/Llama-3.2-11B-Vision-Instruct

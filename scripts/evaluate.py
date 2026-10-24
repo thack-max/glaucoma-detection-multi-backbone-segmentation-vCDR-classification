@@ -48,7 +48,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from src.data.fundus_dataset import FundusDataset
 from src.data.transforms import get_fundus_transforms
@@ -59,6 +58,7 @@ from src.evaluation.metrics import (
     sensitivity_at_specificity,
     specificity_at_sensitivity,
 )
+from src.models.classifier_head import load_classifier_head
 from src.pipeline.screening import ScreeningPipeline
 
 
@@ -144,14 +144,9 @@ def _try_build_encoder(variant: str, device: str):
 
 
 def _try_build_classifier(checkpoint_path: str | None, input_dim: int, device: str):
-    head = nn.Sequential(
-        nn.LayerNorm(input_dim),
-        nn.Dropout(0.3),
-        nn.Linear(input_dim, 1),
-    )
-    if checkpoint_path and Path(checkpoint_path).exists():
-        state = torch.load(checkpoint_path, map_location="cpu")
-        head.load_state_dict(state.get("classifier", state), strict=False)
+    # Same head class train_screening_classifier.py saves; loaded strictly.
+    head = load_classifier_head(checkpoint_path, input_dim)
+    if checkpoint_path:
         print(f"Loaded classifier: {checkpoint_path}")
     head.eval()
     return head.to(device)

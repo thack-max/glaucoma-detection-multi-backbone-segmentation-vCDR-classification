@@ -113,37 +113,47 @@ class LlamaVisionReporter(nn.Module):
 
         try:
             from transformers import MllamaForConditionalGeneration, AutoProcessor
+        except ImportError as e:
+            raise ImportError(
+                "Llama 3.2 Vision requires transformers>=4.45. "
+                "Install with: pip install -e '.[vlm]'"
+            ) from e
 
-            quantization_config = None
-            if self.load_in_4bit:
-                try:
-                    from transformers import BitsAndBytesConfig
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                    )
-                except ImportError:
-                    pass
+        quantization_config = None
+        if self.load_in_4bit:
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+            except ImportError:
+                pass
 
-            self._model = MllamaForConditionalGeneration.from_pretrained(
+        try:
+            model = MllamaForConditionalGeneration.from_pretrained(
                 self.model_name,
                 quantization_config=quantization_config,
                 torch_dtype=torch.float16,
                 device_map="auto",
             )
-            self._processor = AutoProcessor.from_pretrained(self.model_name)
-
-        except ImportError:
+            processor = AutoProcessor.from_pretrained(self.model_name)
+        except ImportError as e:
+            # Optional backends (accelerate for device_map, bitsandbytes for
+            # 4-bit) are only checked here; keep transformers' own message,
+            # which names the missing package and version.
             raise ImportError(
-                "Llama 3.2 Vision requires transformers>=4.45. "
-                "Install with: pip install -e '.[vlm]'"
-            )
+                f"Cannot load {self.model_name}: {e} "
+                f"Install the VLM extras with: pip install -e '.[vlm]'"
+            ) from e
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load {self.model_name}. "
                 f"Ensure you have accepted the Llama license and logged in: "
                 f"huggingface-cli login. Error: {e}"
-            )
+            ) from e
+        # Set both only once both loaded, so a failed load is retried in full.
+        self._model, self._processor = model, processor
 
     def generate_report(
         self,

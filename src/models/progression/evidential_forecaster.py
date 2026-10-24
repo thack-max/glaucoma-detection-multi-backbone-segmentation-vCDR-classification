@@ -153,6 +153,9 @@ class EvidentialForecaster(nn.Module):
             num_classes: Number of progression classes.
         """
         super().__init__()
+        self.temporal_dim = temporal_dim
+        self.clinical_dim = clinical_dim
+        self.vf_dim = vf_dim
 
         total_input = temporal_dim + clinical_dim + vf_dim
 
@@ -182,6 +185,10 @@ class EvidentialForecaster(nn.Module):
     ) -> dict[str, dict[str, torch.Tensor]]:
         """Predict progression with uncertainty.
 
+        The input width is fixed at construction to
+        temporal_dim + clinical_dim + vf_dim: a configured clinical/VF slot
+        whose features are not supplied (missing modality) is zero-filled.
+
         Args:
             temporal_features: [B, temporal_dim] from DeltaTMamba.
             clinical_features: [B, clinical_dim] optional clinical data.
@@ -191,12 +198,31 @@ class EvidentialForecaster(nn.Module):
             Dict with:
               - 'classification': evidential classification output
               - 'regression': evidential regression output (RNFL prediction)
+
+        Raises:
+            ValueError: if a supplied feature's width does not match its
+                configured dim (including features for a slot with dim 0).
         """
+        if temporal_features.shape[-1] != self.temporal_dim:
+            raise ValueError(
+                f"temporal_features has width {temporal_features.shape[-1]}, "
+                f"expected temporal_dim={self.temporal_dim}"
+            )
         parts = [temporal_features]
-        if clinical_features is not None:
-            parts.append(clinical_features)
-        if vf_features is not None:
-            parts.append(vf_features)
+        for name, feats, dim in (
+            ("clinical", clinical_features, self.clinical_dim),
+            ("vf", vf_features, self.vf_dim),
+        ):
+            if feats is None:
+                if dim > 0:
+                    feats = temporal_features.new_zeros(*temporal_features.shape[:-1], dim)
+                    parts.append(feats)
+                continue
+            if feats.shape[-1] != dim:
+                raise ValueError(
+                    f"{name}_features has width {feats.shape[-1]}, expected {name}_dim={dim}"
+                )
+            parts.append(feats)
 
         x = torch.cat(parts, dim=-1)
         h = self.shared(x)

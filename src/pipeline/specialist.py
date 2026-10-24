@@ -23,6 +23,7 @@ All VLM outputs are always marked experimental with mandatory human review.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -201,11 +202,14 @@ class SpecialistPipeline:
 
         # --- VF graph analysis ---
 
+        # Graph-level VF-GIN readout [B, readout_dim]: the VF feature handed to
+        # fusion and the forecaster (as in scripts/train_specialist.py).
+        vf_embedding = None
         if vf_data is not None and self.vf_graph_net is not None:
-            output.vf_classification = self.vf_graph_net(vf_data.to(self.device))
-            output.vf_node_importance = self.vf_graph_net.get_node_importance(
-                vf_data.to(self.device)
-            )
+            vf = vf_data.to(self.device)
+            output.vf_classification = self.vf_graph_net(vf)
+            output.vf_node_importance = self.vf_graph_net.get_node_importance(vf)
+            vf_embedding = self.vf_graph_net.encode_graph(vf)
 
         # --- Multimodal fusion (current visit) ---
 
@@ -215,9 +219,8 @@ class SpecialistPipeline:
                 modality_feats["fundus"] = output.dinov2_fundus_embedding
             if output.dinov2_oct_embedding is not None:
                 modality_feats["oct"] = output.dinov2_oct_embedding
-            if output.vf_classification is not None:
-                # Use the logits as a compact VF feature
-                modality_feats["vf"] = output.vf_classification
+            if vf_embedding is not None:
+                modality_feats["vf"] = vf_embedding
             if clinical_data is not None:
                 clin_vec = torch.tensor(
                     [
@@ -267,9 +270,14 @@ class SpecialistPipeline:
                         device=self.device,
                     ).unsqueeze(0)
 
-                vf_features = None
-                if output.vf_classification is not None:
-                    vf_features = output.vf_classification
+                vf_features = vf_embedding
+
+                # Only feed the auxiliary slots the forecaster was built with;
+                # it zero-fills configured slots whose data is missing.
+                if getattr(self.forecaster, "clinical_dim", None) == 0:
+                    clinical_features = None
+                if getattr(self.forecaster, "vf_dim", None) == 0:
+                    vf_features = None
 
                 try:
                     forecast = self.forecaster(
@@ -303,7 +311,15 @@ class SpecialistPipeline:
                 )
                 output.clinical_report = report.raw_text
                 output.vlm_report_is_experimental = True
-            except (NotImplementedError, RuntimeError):
+            except Exception as exc:  # noqa: BLE001
+                # The report is optional and experimental: a reporter that
+                # cannot load (missing accelerate/bitsandbytes, gated weights)
+                # or fails to generate must not discard the assessment above.
+                warnings.warn(
+                    f"VLM report not generated: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 output.clinical_report = None
 
         return output
